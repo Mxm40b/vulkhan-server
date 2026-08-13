@@ -10,6 +10,11 @@ pkgs.mkShell {
     pkg-config
     clang
     glibc.dev
+    cargo
+    rust-analyzer
+    clippy
+    rustc
+    rustfmt
   ];
   shellHook = ''
     export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"

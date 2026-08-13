@@ -22,7 +22,7 @@ enum SendToWhom<'a> {
     ToAll(Vec<u8>),
     #[allow(dead_code)]
     // because one day the server will send packages to individual users not just on updates, i think
-    ToOne((&'a enet::Peer<'a, u32>, Vec<u8>)),
+    ToOne(Option<&'a enet::Peer<'a, u32>>, Vec<u8>),
 }
 
 impl PacketType {
@@ -162,6 +162,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 // TODO now: send everyone the data of the user.
                                 things_to_send
                                     .push(SendToWhom::ToAll(new_player.to_packet_bytes().clone()));
+                                things_to_send.push(SendToWhom::ToOne(
+                                    Some(&peer.clone()),
+                                    player_data.get(&token).expect("shut up").to_packet_bytes(),
+                                ));
                             } // currently the only way to disconnect is if the user has internet connection
                             // and chooses to disconnect.
                             // todo: if a user timeouts, disconnect them.
@@ -216,8 +220,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .expect("let's assume the packet is sent properly for now");
                     });
                 }
-                SendToWhom::ToOne((peer, packet_to_send)) => peer
+                SendToWhom::ToOne(peer, packet_to_send) => peer
                     .clone()
+                    .expect("oh come on")
                     .send_packet(
                         enet::Packet::new(
                             packet_to_send.as_slice(),
