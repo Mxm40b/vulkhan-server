@@ -228,76 +228,96 @@ fn handle_event(
     things_to_send: &mut Vec<SendToWhom>,
 ) {
     match event {
-        Event::Connect(peer) => {
-            let token = generate_token();
-
-            peer.set_data(Some(token));
-            let new_id = players_data.values().fold(0, |max_up_to_here, data| {
-                if data.id > max_up_to_here {
-                    data.id
-                } else {
-                    max_up_to_here
-                }
-            });
-            // id is incremental: 0, 1, 2...
-            // now if a player quits, and another joins, there will just be an unassigned id.
-            let temp_data = PlayerData::new(new_id);
-            players_data.insert(token, temp_data);
-            let new_player = &players_data
-                .get(&token)
-                .expect("this player exists; they were just created");
-            // TODO now: send everyone the data of the user.
-            things_to_send.push(SendToWhom::ToAll(
-                new_player.to_packet_bytes(PacketType::Join).clone(),
-            ));
-            things_to_send.push(SendToWhom::ToOne(
-                token,
-                players_data
-                    .get(&token)
-                    .expect("shut up")
-                    .with_id(token)
-                    .to_packet_bytes(PacketType::ShareToken),
-            ));
-        } // currently the only way to disconnect is if the user has internet connection
+        Event::Connect(peer) => handle_connect_request(peer, players_data, things_to_send), // currently the only way to disconnect is if the user has internet connection
         // and chooses to disconnect.
         // todo: if a user timeouts, disconnect them.
         // or does enet do that already? idk
-        Event::Disconnect(_peer, token) => {
-            // send everyone a disconnect Packet
-            things_to_send.push(SendToWhom::ToAll(
-                players_data
-                    .get(token)
-                    .expect("uuuugh")
-                    .to_packet_bytes(PacketType::Leave)
-                    .clone(),
-            ));
-            players_data.remove(token);
-        }
+        Event::Disconnect(_peer, token) => handle_disconnect(things_to_send, players_data, token),
         Event::Receive {
             sender: peer,
             packet,
             channel_id: _id,
-        } => {
-            let (packet, _trailing_data) = Packet::ref_from_prefix(packet.data())
-                .expect("for now the server panics when a player sends invalid data");
-            let claimed_token = *peer
-                .data()
-                .expect("shouldn't all peers have data once they connect?");
-            if packet.id == claimed_token {
-                let new_data =
-                    Packet::to_data(*packet, players_data.get(&claimed_token).unwrap().id)
-                        .expect("for now i just really hope that clients send valid data");
-                players_data.insert(packet.id, new_data);
-                things_to_send.push(SendToWhom::ToAll(
-                    players_data
-                        .get(&claimed_token)
-                        .expect("aaaaaaaa")
-                        .to_packet_bytes(PacketType::Update),
-                ));
-            }
-        }
+        } => handle_receive(players_data, things_to_send, peer, packet),
     }
-} // planning for each player to have a connect token u64 created by serv, sent over for each update packet, and unencrypted;
+}
+
+fn handle_connect_request(
+    peer: &mut enet::Peer<u32>,
+    players_data: &mut HashMap<u32, PlayerData>,
+    things_to_send: &mut Vec<SendToWhom>,
+) {
+    let token = generate_token();
+
+    peer.set_data(Some(token));
+    let new_id = players_data.values().fold(0, |max_up_to_here, data| {
+        if data.id > max_up_to_here {
+            data.id
+        } else {
+            max_up_to_here
+        }
+    });
+    // id is incremental: 0, 1, 2...
+    // now if a player quits, and another joins, there will just be an unassigned id.
+    let temp_data = PlayerData::new(new_id);
+    players_data.insert(token, temp_data);
+    let new_player = &players_data
+        .get(&token)
+        .expect("this player exists; they were just created");
+    // TODO now: send everyone the data of the user.
+    things_to_send.push(SendToWhom::ToAll(
+        new_player.to_packet_bytes(PacketType::Join).clone(),
+    ));
+    things_to_send.push(SendToWhom::ToOne(
+        token,
+        players_data
+            .get(&token)
+            .expect("shut up")
+            .with_id(token)
+            .to_packet_bytes(PacketType::ShareToken),
+    ));
+}
+
+fn handle_disconnect(
+    things_to_send: &mut Vec<SendToWhom>,
+    players_data: &mut HashMap<u32, PlayerData>,
+    token: &u32,
+) {
+    // send everyone a disconnect Packet
+    things_to_send.push(SendToWhom::ToAll(
+        players_data
+            .get(token)
+            .expect("uuuugh")
+            .to_packet_bytes(PacketType::Leave)
+            .clone(),
+    ));
+    players_data.remove(token);
+}
+
+fn handle_receive(
+    players_data: &mut HashMap<u32, PlayerData>,
+    things_to_send: &mut Vec<SendToWhom>,
+    peer: &mut enet::Peer<u32>,
+    packet: &mut enet::Packet,
+) {
+    let (packet, _trailing_data) = Packet::ref_from_prefix(packet.data())
+        .expect("for now the server panics when a player sends invalid data");
+    let claimed_token = *peer
+        .data()
+        .expect("shouldn't all peers have data once they connect?");
+    if packet.id == claimed_token {
+        let new_data = Packet::to_data(*packet, players_data.get(&claimed_token).unwrap().id)
+            .expect("for now i just really hope that clients send valid data");
+        players_data.insert(packet.id, new_data);
+        things_to_send.push(SendToWhom::ToAll(
+            players_data
+                .get(&claimed_token)
+                .expect("aaaaaaaa")
+                .to_packet_bytes(PacketType::Update),
+        ));
+    }
+}
+
+// planning for each player to have a connect token u64 created by serv, sent over for each update packet, and unencrypted;
 // a permanent u64 id per server created on first connect, sent in encrypted form (one day)
 //
 // the players will be stored in a fixed-length list of size _max player count_, and positions assigned according to peerId given by enet
