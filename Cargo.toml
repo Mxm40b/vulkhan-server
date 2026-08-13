@@ -1,0 +1,14 @@
+[package]
+name = "vulkhan-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+enet = "0.3.0"
+glam = "0.33.3"
+# using this syntax instead of separately adding zerocopy-derive
+# crate because i don't care much about compile time for now, and i am a beginner,
+# and making sure both crates have the same version is too much of a hassle for me.
+# command was:
+# `cargo add zerocopy --features zerocopy/derive`
+zerocopy = { version = "0.8.56", features = ["derive"] }
