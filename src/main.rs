@@ -13,16 +13,17 @@ enum PacketType {
     Join,
     Leave,
     Update,
+    ShareToken,
 }
 //
 // instead of this, packet will be stored as u32 then converted via a function.
 
 #[derive(Clone)]
-enum SendToWhom<'a> {
+enum SendToWhom {
     ToAll(Vec<u8>),
     #[allow(dead_code)]
     // because one day the server will send packages to individual users not just on updates, i think
-    ToOne(Option<&'a enet::Peer<'a, u32>>, Vec<u8>),
+    ToOne(u32, Vec<u8>),
 }
 
 impl PacketType {
@@ -31,6 +32,7 @@ impl PacketType {
             0 => Some(PacketType::Join),
             1 => Some(PacketType::Leave),
             2 => Some(PacketType::Update),
+            3 => Some(PacketType::ShareToken),
             _ => None,
         }
     }
@@ -39,6 +41,7 @@ impl PacketType {
             Self::Join => 0,
             Self::Leave => 1,
             Self::Update => 2,
+            Self::ShareToken => 3,
         }
     }
 }
@@ -94,15 +97,18 @@ impl PlayerData {
             _orientation: glam::quat(0f32, 0f32, 0f32, 0f32),
         }
     }
-    fn to_packet_bytes(&self) -> Vec<u8> {
+    fn to_packet_bytes(&self, packet_type: PacketType) -> Vec<u8> {
         Packet {
-            packet_type: PacketType::Join.to_u8(),
+            packet_type: packet_type.to_u8(),
             id: self.id,
             position: self._position.to_array(),
             orientation: self._orientation.to_array(),
         }
         .as_bytes()
         .to_vec()
+    }
+    fn with_id(&self, id: u32) -> Self {
+        PlayerData { id, ..*self }
     }
 }
 
@@ -132,7 +138,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     println!("Server started at address: {address}:{port}");
 
-    let mut player_data: HashMap<u32, PlayerData> = HashMap::new();
+    let mut players_data: HashMap<u32, PlayerData> = HashMap::new();
 
     let mut things_to_send: Vec<SendToWhom> = Vec::new();
 
@@ -151,27 +157,47 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 let token = generate_token();
 
                                 peer.set_data(Some(token));
-                                player_data.insert(
-                                    token,
-                                    PlayerData::new(player_data.keys().count() as u32),
-                                ); // id is incremental: 0, 1, 2...
-                                // TODO: fix bug: if player disconnects, the id's clash.
-                                let new_player = &player_data
+                                let new_id =
+                                    players_data.values().fold(0, |max_up_to_here, data| {
+                                        if data.id > max_up_to_here {
+                                            data.id
+                                        } else {
+                                            max_up_to_here
+                                        }
+                                    });
+                                // id is incremental: 0, 1, 2...
+                                // now if a player quits, and another joins, there will just be an unassigned id.
+                                let temp_data = PlayerData::new(new_id);
+                                players_data.insert(token, temp_data);
+                                let new_player = &players_data
                                     .get(&token)
                                     .expect("this player exists; they were just created");
                                 // TODO now: send everyone the data of the user.
-                                things_to_send
-                                    .push(SendToWhom::ToAll(new_player.to_packet_bytes().clone()));
+                                things_to_send.push(SendToWhom::ToAll(
+                                    new_player.to_packet_bytes(PacketType::Join).clone(),
+                                ));
                                 things_to_send.push(SendToWhom::ToOne(
-                                    Some(&peer.clone()),
-                                    player_data.get(&token).expect("shut up").to_packet_bytes(),
+                                    token,
+                                    players_data
+                                        .get(&token)
+                                        .expect("shut up")
+                                        .with_id(token)
+                                        .to_packet_bytes(PacketType::ShareToken),
                                 ));
                             } // currently the only way to disconnect is if the user has internet connection
                             // and chooses to disconnect.
                             // todo: if a user timeouts, disconnect them.
                             // or does enet do that already? idk
                             Event::Disconnect(ref _peer, token) => {
-                                player_data.remove(&token);
+                                // send everyone a disconnect Packet
+                                things_to_send.push(SendToWhom::ToAll(
+                                    players_data
+                                        .get(&token)
+                                        .expect("uuuugh")
+                                        .to_packet_bytes(PacketType::Leave)
+                                        .clone(),
+                                ));
+                                players_data.remove(&token);
                             }
                             Event::Receive {
                                 sender: ref mut peer,
@@ -190,12 +216,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 if packet.id == claimed_token {
                                     let new_data = Packet::to_data(
                                         *packet,
-                                        player_data.get(&claimed_token).unwrap().id,
+                                        players_data.get(&claimed_token).unwrap().id,
                                     )
                                     .expect(
                                         "for now i just really hope that clients send valid data",
                                     );
-                                    player_data.insert(packet.id, new_data);
+                                    players_data.insert(packet.id, new_data);
+                                    things_to_send.push(SendToWhom::ToAll(
+                                        players_data
+                                            .get(&claimed_token)
+                                            .expect("aaaaaaaa")
+                                            .to_packet_bytes(PacketType::Update),
+                                    ));
                                 }
                             }
                         }
@@ -220,18 +252,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .expect("let's assume the packet is sent properly for now");
                     });
                 }
-                SendToWhom::ToOne(peer, packet_to_send) => peer
-                    .clone()
-                    .expect("oh come on")
-                    .send_packet(
-                        enet::Packet::new(
-                            packet_to_send.as_slice(),
-                            enet::PacketMode::ReliableSequenced,
+                SendToWhom::ToOne(token, packet_to_send) => {
+                    let peer = enet.peers().find(|peer| {
+                        *peer
+                            .data()
+                            .expect("no reason why any peer shouldn't have a token")
+                            == token
+                    });
+                    peer.clone()
+                        .expect("oh come on")
+                        .send_packet(
+                            enet::Packet::new(
+                                packet_to_send.as_slice(),
+                                enet::PacketMode::ReliableSequenced,
+                            )
+                            .unwrap(),
+                            0,
                         )
-                        .unwrap(),
-                        0,
-                    )
-                    .expect("not handling this error for now"),
+                        .expect("not handling this error for now")
+                }
             }
         }
     }
