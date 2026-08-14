@@ -64,26 +64,39 @@ fn handle_connect_request(
     let new_player = &players_data
         .get(&token)
         .expect("this player exists; they were just created");
-    // two messages: one will send to all, the connected client too,
-    // their position data, and one will send only to that client,
+    // two messages: one will send to all but the client,
+    // the position data, and one will send only to that client,
     // their token so that they can use it for later messages.
     // the client can differentiate between a ShareToken message
     // and a Join message. one communicates position and token,
     // the other communicates position and id.
-    things_to_send.push(SendToWhom::ToAll(
+    things_to_send.push(SendToWhom::ToAllButOne(
+        token,
         new_player.to_packet_bytes(PacketType::Join).clone(),
     ));
-    things_to_send.push(SendToWhom::ToOne(
-        token,
-        players_data
-            .get(&token)
-            .expect("we are certain this player has a token since they were given one upon connect")
-            // we change the id to the token and reuse the same type of packet
-            // because we are lazy (duplication of position data)
-            // and this is only sent once per connection
-            .with_id(token)
-            .to_packet_bytes(PacketType::ShareToken),
-    ));
+    // this sends the new player all the old players' data
+    for client in players_data.values() {
+        match client.id {
+            id if id == new_id => {
+                things_to_send.push(SendToWhom::ToOne(
+                    token,
+                    players_data
+                        .get(&token)
+                        .expect("we are certain this player has a token since they were given one upon connect")
+                        // we change the id to the token and reuse the same type of packet
+                        // because we are lazy
+                        // and this is only sent once per connection,
+                        // and no useless data is shared anyways
+                        .with_id(token)
+                        .to_packet_bytes(PacketType::ShareToken),
+                ))
+            }
+            _ => things_to_send.push(SendToWhom::ToOne(
+                token,
+                client.to_packet_bytes(PacketType::NotifyStatusOnConnect),
+            )),
+        }
+    }
 }
 
 fn handle_disconnect(
@@ -109,34 +122,52 @@ fn handle_receive(
     packet: &mut enet::Packet,
 ) {
     // token is stored in the enet::Peer type itself
-    let actual_token = *peer
-        .data()
-        .expect("All peers that have connected (this function is called in case of an enet receive event so they have) have had tokens assigned.");
-    if let Ok((packet, _trailing_data)) = Packet::ref_from_prefix(packet.data()) {
-        let claimed_token = packet.id;
-        if claimed_token == actual_token {
-            if let Some(new_data) =
-                Packet::to_data(*packet, players_data.get(&actual_token).unwrap().id)
-            {
-                players_data.insert(packet.id, new_data);
-                // send update to all players
-                things_to_send.push(SendToWhom::ToAll(
-                    players_data
-                        .get(&actual_token)
-                        .expect("this peer has data assigned to their token, because they have connected at some point, and were assigned data on connect.")
-                        .to_packet_bytes(PacketType::Update),
-                ))
+    let actual_token = *peer.data().expect("all peers given token on connect");
+    if let Ok((header, _training_data)) = PacketHeader::ref_from_prefix(packet.data()) {
+        if let Some(packet_type) = PacketType::from_u8(header.packet_type) {
+            if packet_type == PacketType::Update {
+                if let Ok((packet, _trailing_data)) = UpdatePacket::ref_from_prefix(packet.data()) {
+                    let claimed_token = packet.header.id;
+                    if claimed_token == actual_token {
+                        if let Some(new_data) = Packet::to_data(
+                            Packet::Update(*packet),
+                            players_data.get(&actual_token).unwrap().id,
+                        ) {
+                            players_data.insert(packet.header.id, new_data);
+                            // send update to all players
+                            things_to_send.push(SendToWhom::ToAll(
+                                players_data
+                                    .get(&actual_token)
+                                    .expect("all peers given token on connect")
+                                    .to_packet_bytes(PacketType::Update),
+                            ))
+                        } else {
+                            eprintln!(
+                                "Data sent by peer {:?} with token `{}` could not be read!",
+                                peer, actual_token
+                            )
+                        };
+                    } else {
+                        eprintln!(
+                            "Peer {:?} with expected connect token `{}` sent mismatching token `{}` instead.",
+                            peer, actual_token, claimed_token
+                        )
+                    }
+                } else {
+                    // if the player sends invalid packets, we ignore it for now. Might want more complex behaviour later on.
+                    eprintln!(
+                        "Peer {:?} with connect token `{}` sent invalid packets.",
+                        peer, actual_token
+                    )
+                };
             } else {
                 eprintln!(
-                    "Data sent by peer {:?} with token `{}` could not be read!",
-                    peer, actual_token
+                    "error: received a packet of non-update type {:#?} when enet gave a Receive event.",
+                    packet_type
                 )
-            };
+            }
         } else {
-            eprintln!(
-                "Peer {:?} with expected connect token `{}` sent mismatching token `{}` instead.",
-                peer, actual_token, claimed_token
-            )
+            eprintln!("error: could not read packet type from the packet header.")
         }
     } else {
         // if the player sends invalid packets, we ignore it for now. Might want more complex behaviour later on.
@@ -166,13 +197,29 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
                 }
             });
         }
+        // in this case, we do not check that this user exists, we assume
+        // function that said to send this can be trusted.
+        SendToWhom::ToAllButOne(token, packet_to_send) => {
+            enet.peers().for_each(move |mut peer| {
+                if *peer.data().expect("all peers given token on connect") == token {
+                    match enet::Packet::new(
+                        packet_to_send.as_slice(),
+                        enet::PacketMode::ReliableSequenced,
+                    ) {
+                        Ok(packet) => match peer.send_packet(packet, 0) {
+                            Ok(_) => (),
+                            Err(e) => eprintln!("error: could not send packet, got error: {e}"),
+                        },
+                        Err(e) => eprintln!("Could not convert data to packet, got error: {e}"),
+                    }
+                }
+            });
+        }
         SendToWhom::ToOne(token, packet_to_send) => {
-            if let Some(peer) = enet.peers().find(|peer| {
-                *peer
-                    .data()
-                    .expect("no reason why any peer shouldn't have a token, since on connect they are given one.")
-                    == token
-            }) {
+            if let Some(peer) = enet
+                .peers()
+                .find(|peer| *peer.data().expect("all peers given token on connect") == token)
+            {
                 match enet::Packet::new(
                     packet_to_send.as_slice(),
                     enet::PacketMode::ReliableSequenced,

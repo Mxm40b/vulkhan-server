@@ -2,7 +2,6 @@ use enet::Event;
 use enet::{Address, Enet};
 use std::net;
 use std::{collections::HashMap, error::Error};
-use vulkhan_server;
 
 const MAX_PLAYERS: usize = 32;
 
@@ -44,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             await_event(attempt, &mut players_data, &mut things_to_send);
         };
         // end of that scope to get rid of enet borrowing error
-        for to_do in things_to_send.clone() {
+        for to_do in things_to_send.drain(..) {
             vulkhan_server::handle_send_list(to_do, &mut enet);
         }
     }

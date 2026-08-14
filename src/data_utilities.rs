@@ -1,17 +1,22 @@
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum PacketType {
+    // sent to tell players that are already/still here who joined/left:
     Join,
     Leave,
     Update,
+    // serves to share token and spawn position on connect:
     ShareToken,
+    // serves to tell the player who was already on the server:
+    NotifyStatusOnConnect,
 }
 
 #[derive(Clone)]
 pub enum SendToWhom {
     ToAll(Vec<u8>),
     ToOne(u32, Vec<u8>),
+    ToAllButOne(u32, Vec<u8>),
 }
 
 impl PacketType {
@@ -21,6 +26,7 @@ impl PacketType {
             1 => Some(PacketType::Leave),
             2 => Some(PacketType::Update),
             3 => Some(PacketType::ShareToken),
+            4 => Some(PacketType::NotifyStatusOnConnect),
             _ => None,
         }
     }
@@ -30,18 +36,30 @@ impl PacketType {
             Self::Leave => 1,
             Self::Update => 2,
             Self::ShareToken => 3,
+            Self::NotifyStatusOnConnect => 4,
         }
     }
 }
 
+pub enum Packet {
+    Update(UpdatePacket),
+    Header(PacketHeader),
+}
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
-pub struct Packet {
-    packet_type: u8,
+pub struct PacketHeader {
+    pub packet_type: u8,
     pub id: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct UpdatePacket {
+    pub header: PacketHeader,
     // can be both token and user id depending on context
-    position: [f32; 3],
-    orientation: [f32; 4],
+    pub position: [f32; 3],
+    pub orientation: [f32; 4],
 }
 
 impl Packet {
@@ -49,25 +67,34 @@ impl Packet {
     // because they are not interchangeable in rust
     pub fn to_data(self, id: u32) -> Option<PlayerData> {
         // TODO: make this return a Result<PlayerData, Error> so that calling code handles it
-        if let Some(packet) = PacketType::from_u8(self.packet_type) {
-            if packet == PacketType::Update {
-                Some(PlayerData {
-                    id,
-                    orientation: glam::Quat::from_xyzw(
-                        self.orientation[0],
-                        self.orientation[1],
-                        self.orientation[2],
-                        self.orientation[3],
-                    ),
-                    position: glam::Vec3::new(self.position[0], self.position[1], self.position[2]),
-                })
-            } else {
-                eprintln!("error: PacketType was not of Update type, ignoring it");
-                None
+        match self {
+            Packet::Update(UpdatePacket {
+                header,
+                position,
+                orientation,
+            }) => {
+                if let Some(packet) = PacketType::from_u8(header.packet_type) {
+                    if packet == PacketType::Update {
+                        Some(PlayerData {
+                            id,
+                            orientation: glam::Quat::from_xyzw(
+                                orientation[0],
+                                orientation[1],
+                                orientation[2],
+                                orientation[3],
+                            ),
+                            position: glam::Vec3::new(position[0], position[1], position[2]),
+                        })
+                    } else {
+                        eprintln!("error: PacketType was not of Update type, ignoring it");
+                        None
+                    }
+                } else {
+                    eprintln!("error: could not convert packet to data");
+                    None
+                }
             }
-        } else {
-            eprintln!("error: could not convert packet to data");
-            None
+            Packet::Header(_) => None,
         }
     }
 }
@@ -84,7 +111,7 @@ impl PlayerData {
             id,
             // starting position:
             position: glam::Vec3::new(0f32, 0f32, 0f32),
-            orientation: glam::quat(0f32, 0f32, 0f32, 0f32),
+            orientation: glam::Quat::IDENTITY,
         }
     }
     // to make sure the packet sent back has the same structure
@@ -92,14 +119,28 @@ impl PlayerData {
     // correctly laid-out in memory
     // Packet type then take it as bytes
     pub fn to_packet_bytes(&self, packet_type: PacketType) -> Vec<u8> {
-        Packet {
-            packet_type: packet_type.to_u8(),
-            id: self.id,
-            position: self.position.to_array(),
-            orientation: self.orientation.to_array(),
+        match packet_type {
+            PacketType::Update
+            | PacketType::Join
+            | PacketType::NotifyStatusOnConnect
+            | PacketType::ShareToken => UpdatePacket {
+                header: PacketHeader {
+                    packet_type: packet_type.to_u8(),
+                    id: self.id,
+                },
+                position: self.position.to_array(),
+                orientation: self.orientation.to_array(),
+            }
+            .as_bytes()
+            .to_vec(),
+            // only sending header with player id when a player disconnects instead of everything
+            PacketType::Leave => PacketHeader {
+                packet_type: packet_type.to_u8(),
+                id: self.id,
+            }
+            .as_bytes()
+            .to_vec(),
         }
-        .as_bytes()
-        .to_vec()
     }
     pub fn with_id(&self, id: u32) -> Self {
         PlayerData { id, ..*self }
