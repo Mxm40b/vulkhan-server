@@ -1,5 +1,7 @@
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use std::collections::HashMap;
+
 #[derive(PartialEq, Debug)]
 pub enum PacketType {
     // sent to tell players that are already/still here who joined/left:
@@ -155,3 +157,19 @@ pub fn generate_token() -> u32 {
         .as_secs() as u32
     // using as u32 removes the upper bits
 }
+
+#[derive(Default)]
+pub struct ServerState {
+    pub players_data: HashMap<u32, PlayerData>,
+
+    pub things_to_send: Vec<SendToWhom>,
+}
+
+// impl ServerState {
+//     pub fn new() -> Self {
+//         Self {
+//             players_data: HashMap::new(),
+//             things_to_send: Vec::new(),
+//         }
+//     }
+// }

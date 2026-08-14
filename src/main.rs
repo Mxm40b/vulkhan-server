@@ -1,7 +1,7 @@
 use enet::Event;
 use enet::{Address, Enet};
+use std::error::Error;
 use std::net;
-use std::{collections::HashMap, error::Error};
 
 const MAX_PLAYERS: usize = 32;
 
@@ -22,10 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     println!("Server started at address: {address}:{port}");
 
-    let mut players_data: HashMap<u32, PlayerData> = HashMap::new();
-
-    let mut things_to_send: Vec<SendToWhom> = Vec::new();
-
+    let mut server_state = vulkhan_server::data_utilities::ServerState::default();
     loop {
         // in loop, in each iteration create new context for reading Events.
         // this fixes the fact that enet is borrowed in that scope when service()
@@ -40,10 +37,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         // this let statement is the scope in question:
         let () = {
             let attempt = enet.service(1000); // this lineeeeee... UUUUUUGH
-            await_event(attempt, &mut players_data, &mut things_to_send);
+            await_event(attempt, &mut server_state);
         };
         // end of that scope to get rid of enet borrowing error
-        for to_do in things_to_send.drain(..) {
+        for to_do in server_state.things_to_send.drain(..) {
             vulkhan_server::handle_send_list(to_do, &mut enet);
         }
     }
@@ -53,8 +50,7 @@ pub use vulkhan_server::data_utilities::{PlayerData, SendToWhom};
 
 fn await_event(
     attempt: Result<Option<Event<'_, u32>>, enet::Error>,
-    players_data: &mut HashMap<u32, PlayerData>,
-    things_to_send: &mut Vec<SendToWhom>,
+    server_state: &mut vulkhan_server::ServerState,
 ) {
     if let Ok(event) = attempt {
         match event {
@@ -63,7 +59,7 @@ fn await_event(
             // otherwise we handle the event:
             Some(event) => {
                 let mut event = event; // to borrow it as mutable, not sure how but it works
-                vulkhan_server::handle_event(&mut event, players_data, things_to_send);
+                vulkhan_server::handle_event(&mut event, server_state);
             }
         }
     } else {
