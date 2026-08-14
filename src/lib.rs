@@ -104,15 +104,17 @@ fn handle_disconnect(server_state: &mut ServerState, token: &u32) {
         return;
     }
 
-    let Some(player) = players_data.get(token) else {
-        eprintln!("warning: player {token} disconnected but no player data was stored for it, ignoring");
+    let Some(player) = server_state.players_data.get(token) else {
+        eprintln!(
+            "warning: player {token} disconnected but no player data was stored for it, ignoring"
+        );
         return;
     };
     // send everyone a disconnect Packet
-    things_to_send.push(SendToWhom::ToAll(
+    server_state.things_to_send.push(SendToWhom::ToAll(
         player.to_packet_bytes(PacketType::Leave).clone(),
     ));
-    players_data.remove(token);
+    server_state.players_data.remove(token);
 }
 
 fn handle_receive(
