@@ -96,14 +96,23 @@ fn handle_connect_request(peer: &mut enet::Peer<u32>, server_state: &mut ServerS
 
 fn handle_disconnect(server_state: &mut ServerState, token: &u32) {
     // send everyone a disconnect Packet
-    server_state.things_to_send.push(SendToWhom::ToAll(
-        server_state.players_data
-            .get(token)
-            .expect("if the player disconnects, we are certain they connected at some point and therefore we stored their data")
-            .to_packet_bytes(PacketType::Leave)
-            .clone(),
+    if *token == 0 {
+        // ENet clears a peer's user data to 0 on a forced/abrupt reset
+        // (as opposed to a graceful disconnect), so a Disconnect event
+        // can arrive with no real token attached. 0 was never handed out
+        // by generate_token(), so treat it as "nothing to clean up".
+        return;
+    }
+
+    let Some(player) = players_data.get(token) else {
+        eprintln!("warning: player {token} disconnected but no player data was stored for it, ignoring");
+        return;
+    };
+    // send everyone a disconnect Packet
+    things_to_send.push(SendToWhom::ToAll(
+        player.to_packet_bytes(PacketType::Leave).clone(),
     ));
-    server_state.players_data.remove(token);
+    players_data.remove(token);
 }
 
 fn handle_receive(
