@@ -63,6 +63,6 @@ fn await_event(
             }
         }
     } else {
-        panic!("{attempt:?}")
+        eprintln!("{attempt:?}")
     };
 }
