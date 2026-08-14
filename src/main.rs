@@ -2,7 +2,7 @@ use enet::Event;
 use enet::{Address, Enet};
 use std::net;
 use std::{collections::HashMap, error::Error};
-use vulkhan_server::*;
+use vulkhan_server;
 
 const MAX_PLAYERS: usize = 32;
 
@@ -45,10 +45,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         // end of that scope to get rid of enet borrowing error
         for to_do in things_to_send.clone() {
-            handle_send_list(to_do, &mut enet);
+            vulkhan_server::handle_send_list(to_do, &mut enet);
         }
     }
 }
+
+pub use vulkhan_server::data_utilities::{PlayerData, SendToWhom};
 
 fn await_event(
     attempt: Result<Option<Event<'_, u32>>, enet::Error>,
@@ -62,17 +64,10 @@ fn await_event(
             // otherwise we handle the event:
             Some(event) => {
                 let mut event = event; // to borrow it as mutable, not sure how but it works
-                handle_event(&mut event, players_data, things_to_send);
+                vulkhan_server::handle_event(&mut event, players_data, things_to_send);
             }
         }
     } else {
         panic!("{attempt:?}")
     };
 }
-
-// planning for each player to have a connect token u64 created by serv, sent over for each update packet, and unencrypted;
-// a permanent u64 id per server created on first connect, sent in encrypted form (one day)
-//
-// the players will be stored in a fixed-length list of size _max player count_, and positions assigned according to peerId given by enet
-// then, each player sending a packet will send their session token and their id (enet handles this), and the server will check that token
-// against the one stored at that address in the list.
