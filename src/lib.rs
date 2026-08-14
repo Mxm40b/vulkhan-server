@@ -6,9 +6,11 @@ pub mod data_utilities;
 
 use data_utilities::*;
 
-// TODO: fix all .expect()'s for the server to not crash constantly
-
 // if an event occured, we handle it:
+// note: none of the helper functions return errors, because
+// we need not handle them; in the context of a game server,
+// we can ignore them and hope the next update will succeed.
+// we do _not_ want to interrupt the program flow because of an error.
 pub fn handle_event(
     event: &mut enet::Event<u32>,
     players_data: &mut HashMap<u32, PlayerData>,
@@ -75,7 +77,7 @@ fn handle_connect_request(
         token,
         players_data
             .get(&token)
-            .expect("shut up")
+            .expect("we are certain this player has a token since they were given one upon connect")
             // we change the id to the token and reuse the same type of packet
             // because we are lazy (duplication of position data)
             // and this is only sent once per connection
@@ -93,7 +95,7 @@ fn handle_disconnect(
     things_to_send.push(SendToWhom::ToAll(
         players_data
             .get(token)
-            .expect("uuuugh")
+            .expect("if the player disconnects, we are certain they connected at some point and therefore we stored their data")
             .to_packet_bytes(PacketType::Leave)
             .clone(),
     ));
@@ -106,25 +108,43 @@ fn handle_receive(
     peer: &mut enet::Peer<u32>,
     packet: &mut enet::Packet,
 ) {
-    let (packet, _trailing_data) = Packet::ref_from_prefix(packet.data())
-        .expect("for now the server panics when a player sends invalid data");
     // token is stored in the enet::Peer type itself
     let actual_token = *peer
         .data()
-        .expect("shouldn't all peers have data once they connect?");
-    let claimed_token = packet.id;
-    if claimed_token == actual_token {
-        let new_data = Packet::to_data(*packet, players_data.get(&actual_token).unwrap().id)
-            .expect("for now i just really hope that clients send valid data");
-        players_data.insert(packet.id, new_data);
-        // send update to all players
-        things_to_send.push(SendToWhom::ToAll(
-            players_data
-                .get(&claimed_token)
-                .expect("aaaaaaaa")
-                .to_packet_bytes(PacketType::Update),
-        ));
-    }
+        .expect("All peers that have connected (this function is called in case of an enet receive event so they have) have had tokens assigned.");
+    if let Ok((packet, _trailing_data)) = Packet::ref_from_prefix(packet.data()) {
+        let claimed_token = packet.id;
+        if claimed_token == actual_token {
+            if let Some(new_data) =
+                Packet::to_data(*packet, players_data.get(&actual_token).unwrap().id)
+            {
+                players_data.insert(packet.id, new_data);
+                // send update to all players
+                things_to_send.push(SendToWhom::ToAll(
+                    players_data
+                        .get(&actual_token)
+                        .expect("this peer has data assigned to their token, because they have connected at some point, and were assigned data on connect.")
+                        .to_packet_bytes(PacketType::Update),
+                ))
+            } else {
+                eprintln!(
+                    "Data sent by peer {:?} with token `{}` could not be read!",
+                    peer, actual_token
+                )
+            };
+        } else {
+            eprintln!(
+                "Peer {:?} with expected connect token `{}` sent mismatching token `{}` instead.",
+                peer, actual_token, claimed_token
+            )
+        }
+    } else {
+        // if the player sends invalid packets, we ignore it for now. Might want more complex behaviour later on.
+        eprintln!(
+            "Peer {:?} with connect token `{}` sent invalid packets.",
+            peer, actual_token
+        )
+    };
 }
 
 // because there is a send list with kinds of messages to send, this one sends all,
@@ -134,35 +154,47 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
     match to_do.clone() {
         SendToWhom::ToAll(packet_to_send) => {
             enet.peers().for_each(move |mut peer| {
-                peer.send_packet(
-                    enet::Packet::new(
-                        packet_to_send.as_slice(),
-                        enet::PacketMode::ReliableSequenced,
-                    )
-                    .expect("oh shut up"),
-                    0,
-                )
-                .expect("let's assume the packet is sent properly for now");
+                match enet::Packet::new(
+                    packet_to_send.as_slice(),
+                    enet::PacketMode::ReliableSequenced,
+                ) {
+                    Ok(packet) => match peer.send_packet(packet, 0) {
+                        Ok(_) => (),
+                        Err(e) => eprintln!("error: could not send packet, got error: {e}"),
+                    },
+                    Err(e) => eprintln!("Could not convert data to packet, got error: {e}"),
+                }
             });
         }
         SendToWhom::ToOne(token, packet_to_send) => {
-            let peer = enet.peers().find(|peer| {
+            if let Some(peer) = enet.peers().find(|peer| {
                 *peer
                     .data()
-                    .expect("no reason why any peer shouldn't have a token")
+                    .expect("no reason why any peer shouldn't have a token, since on connect they are given one.")
                     == token
-            });
-            peer.clone()
-                .expect("oh come on")
-                .send_packet(
-                    enet::Packet::new(
-                        packet_to_send.as_slice(),
-                        enet::PacketMode::ReliableSequenced,
-                    )
-                    .unwrap(),
-                    0,
+            }) {
+                match enet::Packet::new(
+                    packet_to_send.as_slice(),
+                    enet::PacketMode::ReliableSequenced,
+                ) {
+                    Ok(packet) => match peer.clone().send_packet(packet, 0) {
+                        Ok(_) => (),
+                        Err(e) => eprintln!(
+                            "error: could not send packet to peer {:?}, instead got: {}",
+                            peer, e
+                        ),
+                    },
+                    Err(e) => eprintln!(
+                        "error: could not turn data {:?} into enet packet, instead got: {}",
+                        packet_to_send, e
+                    ),
+                }
+            } else {
+                eprintln!(
+                    "error: tried to send data to peer with token {} but no such peer was found.",
+                    token
                 )
-                .expect("not handling this error for now")
+            }
         }
     }
 }

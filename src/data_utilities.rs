@@ -48,22 +48,27 @@ impl Packet {
     // convert a packet to usable data
     // because they are not interchangeable in rust
     pub fn to_data(self, id: u32) -> Option<PlayerData> {
-        if PacketType::from_u8(self.packet_type)
-            .expect("server does not handle unvalid packet type for now")
-            == PacketType::Update
-        {
-            return Some(PlayerData {
-                id,
-                orientation: glam::Quat::from_xyzw(
-                    self.orientation[0],
-                    self.orientation[1],
-                    self.orientation[2],
-                    self.orientation[3],
-                ),
-                position: glam::Vec3::new(self.position[0], self.position[1], self.position[2]),
-            });
-        };
-        None
+        // TODO: make this return a Result<PlayerData, Error> so that calling code handles it
+        if let Some(packet) = PacketType::from_u8(self.packet_type) {
+            if packet == PacketType::Update {
+                Some(PlayerData {
+                    id,
+                    orientation: glam::Quat::from_xyzw(
+                        self.orientation[0],
+                        self.orientation[1],
+                        self.orientation[2],
+                        self.orientation[3],
+                    ),
+                    position: glam::Vec3::new(self.position[0], self.position[1], self.position[2]),
+                })
+            } else {
+                eprintln!("error: PacketType was not of Update type, ignoring it");
+                None
+            }
+        } else {
+            eprintln!("error: could not convert packet to data");
+            None
+        }
     }
 }
 
