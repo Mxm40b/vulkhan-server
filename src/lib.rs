@@ -51,8 +51,9 @@ fn handle_connect_request(
             } else {
                 max_up_to_here
             }
-        });
-    // id is incremental: 0, 1, 2...
+        })
+        + 1;
+    // id is incremental: 1, 2, 3...
     // now if a player quits, and another joins, there will just be an unassigned id.
     // TODO: better implement this behaviour, because every single time a player connects,
     // we search through, instead we could just have an incremented variable
@@ -251,7 +252,7 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
         // function that said to send this can be trusted.
         SendToWhom::ToAllButOne(token, packet_to_send) => {
             enet.peers().for_each(move |mut peer| {
-                if *peer.data().expect("all peers given token on connect") == token {
+                if *peer.data().expect("all peers given token on connect") != token {
                     match enet::Packet::new(
                         packet_to_send.as_slice(),
                         enet::PacketMode::ReliableSequenced,

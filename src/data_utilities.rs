@@ -1,5 +1,7 @@
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use rand;
+
 use std::collections::HashMap;
 
 #[derive(PartialEq, Debug)]
@@ -150,12 +152,7 @@ impl PlayerData {
 }
 
 pub fn generate_token() -> u32 {
-    // todo: use better random algorithm for generating tokens than this
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("why wouldn't it calculate the duration since epoch??")
-        .as_secs() as u32
-    // using as u32 removes the upper bits
+    rand::random::<u32>() // thank you, rand crate!
 }
 
 #[derive(Default)]
