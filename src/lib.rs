@@ -30,12 +30,13 @@ pub fn handle_event(
 // packet with their UUID (see handle_receive). Any packet other than Hello
 // from an un-identified peer is dropped there.
 fn handle_connect_request(
-    peer: &mut enet::Peer<u32>,
-    server_state: &mut ServerState,
+    _peer: &mut enet::Peer<u32>,
+    _server_state: &mut ServerState,
 ) -> Result<(), EventError> {
-    let id = generate_session_id(server_state);
-    peer.set_data(Some(id));
-    server_state.players_data.insert(id, PlayerData::new());
+    // we do this when we receive a ConnectPacket instead:
+    // let id = generate_session_id(server_state);
+    // peer.set_data(Some(id));
+    // server_state.players_data.insert(id, PlayerData::new(None));
     Ok(())
 }
 
@@ -89,17 +90,55 @@ fn handle_receive(
         ReceiveError::UnreadableHeader { id: peer_id },
     ))?;
 
-    if packet_type == PacketType::Hello {
-        return handle_hello(server_state, peer, packet);
-    }
-
     // Every other packet type requires an already-identified peer; anyone
     // who hasn't sent their Hello yet is silently ignored, per design.
 
     match packet_type {
         // TODO: handle the Hello type
         PacketType::Hello => {
-            eprintln!("warning: ignoring hello packet")
+            let (hello_packet, _trailing_data) = HelloPacket::ref_from_prefix(packet.data())
+                .map_err(|_| EventError::ReceiveError(ReceiveError::UnreadableHelloDataReceived))?;
+            if let Some(&existing_id) = peer.data() {
+                // a player sent two hello's. Pff. Looser.
+                return Err(EventError::ReceiveError(ReceiveError::HelloDuplication {
+                    id: existing_id,
+                }));
+            }
+            let new_id = generate_session_id(server_state);
+            peer.set_data(Some(new_id));
+
+            let new_player_data = PlayerData::new(hello_packet.uuid);
+            server_state
+                .players_data
+                .insert(new_id, new_player_data.clone());
+
+            server_state.things_to_send.push(SendToWhom::ToAllButOne(
+                new_id,
+                new_player_data.to_packet_bytes(PacketType::Join, new_id),
+                enet::PacketMode::ReliableSequenced,
+            ));
+
+            server_state.things_to_send.push(SendToWhom::ToOne(
+                new_id,
+                new_player_data.to_packet_bytes(PacketType::Spawn, new_id),
+                enet::PacketMode::ReliableSequenced,
+            ));
+
+            server_state
+                .players_data
+                .iter()
+                // idk why need to deref twice but it works:
+                // this line is to not send to the user that just connected, their own data, we just did that:
+                .filter(|(key, _value)| (**key) != new_id)
+                .map(|(&key, existing_player)| {
+                    server_state.things_to_send.push(SendToWhom::ToOne(
+                        new_id,
+                        existing_player.to_packet_bytes(PacketType::Join, key),
+                        enet::PacketMode::ReliableSequenced,
+                    ));
+                })
+                // consumes the iterator:
+                .for_each(drop);
         }
         PacketType::Join | PacketType::Leave | PacketType::PropagateUpdate | PacketType::Spawn => {
             return Err(EventError::ReceiveError(ReceiveError::NonUpdateEvent {
@@ -107,6 +146,7 @@ fn handle_receive(
             }));
         }
         PacketType::Update => {
+            // if the peer does not have an associated id, we exit early; they need to send a ConnectPacket first.
             let id = peer_id.ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?;
             let (packet, _trailing_data) =
                 UpdatePacket::ref_from_prefix(packet.data()).map_err(|_| {
@@ -128,6 +168,13 @@ fn handle_receive(
                 EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id }),
             )?;
 
+            let Some(old_data) = server_state.players_data.get(&id) else {
+                return Err(EventError::ReceiveError(
+                    ReceiveError::AssociatedDataNotFound { id },
+                ));
+            };
+            let new_data = integrate_position_data_with_player_data(new_data, old_data);
+
             // new_data.0 is the id, and we already have it
             server_state.players_data.insert(id, new_data);
 
@@ -145,68 +192,82 @@ fn handle_receive(
     Ok(())
 }
 
+fn integrate_position_data_with_player_data(
+    position_data: PlayerPositionData,
+    old_data: &PlayerData,
+) -> PlayerData {
+    PlayerData {
+        position: position_data.position,
+        orientation: position_data.orientation,
+        ..*old_data
+    }
+}
+
 // Handles a client's one-time Hello: assigns them a session id, registers
 // their player data, tells everyone else they joined, and dumps the
 // existing players' state back to them (reusing the Join wire format --
 // the client treats Join and this dump identically).
-fn handle_hello(
-    server_state: &mut ServerState,
-    peer: &mut enet::Peer<u32>,
-    packet: &mut enet::Packet,
-) -> Result<(), EventError> {
-    if let Some(&existing_id) = peer.data() {
-        // Already identified; a repeated Hello is ignored rather than
-        // re-assigning a new session id out from under them.
-        return Err(EventError::ReceiveError(ReceiveError::AlreadyIdentified {
-            id: existing_id,
-        }));
-    }
+//
+//
+// P plz stop slop coding, I am moving code from this function into the match statement.
+// fn handle_hello(
+//     server_state: &mut ServerState,
+//     peer: &mut enet::Peer<u32>,
+//     packet: &mut enet::Packet,
+// ) -> Result<(), EventError> {
+//     if let Some(&existing_id) = peer.data() {
+//         // Already identified; a repeated Hello is ignored rather than
+//         // re-assigning a new session id out from under them.
+//         return Err(EventError::ReceiveError(ReceiveError::HelloDuplication {
+//             id: existing_id,
+//         }));
+//     }
 
-    let Ok((_hello, _trailing_data)) = HelloPacket::ref_from_prefix(packet.data()) else {
-        return Err(EventError::ReceiveError(ReceiveError::UnreadableHello));
-    };
-    // `_hello.uuid` is the client's persistent identity. We don't yet key
-    // anything off it server-side (no reconnect/database support), but it's
-    // parsed and validated here so that's a drop-in addition later.
+//     let Ok((hello, _trailing_data)) = HelloPacket::ref_from_prefix(packet.data()) else {
+//         return Err(EventError::ReceiveError(ReceiveError::UnreadableHello));
+//     };
+//     // `_hello.uuid` is the client's persistent identity. We don't yet key
+//     // anything off it server-side (no reconnect/database support), but it's
+//     // parsed and validated here so that's a drop-in addition later.
 
-    let new_id = generate_session_id(server_state);
-    peer.set_data(Some(new_id));
+//     let new_id = generate_session_id(server_state);
+//     peer.set_data(Some(new_id));
 
-    let new_player_data = PlayerData::new();
-    server_state
-        .players_data
-        .insert(new_id, new_player_data.clone());
+//     let new_player_data = PlayerData::new(hello.uuid);
+//     server_state
+//         .players_data
+//         .insert(new_id, new_player_data.clone());
 
-    server_state.things_to_send.push(SendToWhom::ToAllButOne(
-        new_id,
-        new_player_data.to_packet_bytes(PacketType::Join, new_id),
-        enet::PacketMode::ReliableSequenced,
-    ));
+//     server_state.things_to_send.push(SendToWhom::ToAllButOne(
+//         new_id,
+//         new_player_data.to_packet_bytes(PacketType::Join, new_id),
+//         enet::PacketMode::ReliableSequenced,
+//     ));
 
-    server_state.things_to_send.push(SendToWhom::ToOne(
-        new_id,
-        new_player_data.to_packet_bytes(PacketType::Spawn, new_id),
-        enet::PacketMode::ReliableSequenced,
-    ));
+//     server_state.things_to_send.push(SendToWhom::ToOne(
+//         new_id,
+//         new_player_data.to_packet_bytes(PacketType::Spawn, new_id),
+//         enet::PacketMode::ReliableSequenced,
+//     ));
 
-    server_state
-        .players_data
-        .iter()
-        // idk why need to deref twice but it works:
-        // this line is to not send to the user that just connected, their own data, we just did that:
-        .filter(|(key, _value)| (**key) != new_id)
-        .map(|(&key, existing_player)| {
-            server_state.things_to_send.push(SendToWhom::ToOne(
-                new_id,
-                existing_player.to_packet_bytes(PacketType::Join, key),
-                enet::PacketMode::ReliableSequenced,
-            ));
-        })
-        // consumes the iterator:
-        .for_each(drop);
+//     server_state
+//         .players_data
+//         .iter()
+//         // idk why need to deref twice but it works:
+//         // this line is to not send to the user that just connected, their own data, we just did that:
+//         .filter(|(key, _value)| (**key) != new_id)
+//         .map(|(&key, existing_player)| {
+//             server_state.things_to_send.push(SendToWhom::ToOne(
+//                 new_id,
+//                 existing_player.to_packet_bytes(PacketType::Join, key),
+//                 enet::PacketMode::ReliableSequenced,
+//             ));
+//         })
+//         // consumes the iterator:
+//         .for_each(drop);
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 // because there is a send list with kinds of messages to send, this one sends all,
 // from the main thread
@@ -315,9 +376,9 @@ pub fn handle_event_error(e: EventError) {
                     "error: received a packet of non-update type from peer with unknown id; only Update and Hello are valid from a client."
                 ),
             },
-            ReceiveError::AlreadyIdentified { id } => {
+            ReceiveError::HelloDuplication { id } => {
                 eprintln!(
-                    "note: peer `{}` sent a second Hello after already being identified; ignored.",
+                    "ERROR: LISTEN EVERYONE! Check this out: peer with id `{}` sent multiple Hello's, such a looser client. \n`Oooo, but i had too much bandwidth` \n\t- the peer. \nlmao.",
                     id
                 );
             }
@@ -329,6 +390,11 @@ pub fn handle_event_error(e: EventError) {
             }
             ReceiveError::UnreadableDataReceived { id } => {
                 eprintln!("error: data sent by peer `{}` could not be read!", id);
+            }
+            ReceiveError::UnreadableHelloDataReceived => {
+                eprintln!(
+                    "error: data sent in hello packet (so by an unknown player) could not be read!"
+                );
             }
             ReceiveError::AssociatedDataNotFound { id } => {
                 eprintln!(

@@ -135,7 +135,7 @@ impl Packet {
     // (from its Hello handshake) -- we no longer trust an id field the
     // client sends us on every packet, since the client doesn't send one
     // anymore.
-    pub fn to_data(self) -> Option<PlayerData> {
+    pub fn to_data(self) -> Option<PlayerPositionData> {
         match self {
             Packet::Update(UpdatePacket {
                 header,
@@ -144,7 +144,7 @@ impl Packet {
             }) => {
                 if let Some(packet) = PacketType::from_u8(header.packet_type) {
                     if packet == PacketType::Update {
-                        Some(PlayerData {
+                        Some(PlayerPositionData {
                             orientation: glam::Quat::from_xyzw(
                                 orientation[0],
                                 orientation[1],
@@ -173,20 +173,32 @@ impl Packet {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PlayerData {
-    position: glam::Vec3,
-    orientation: glam::Quat,
-    // now the player id is the same as the token, and we are ignoring uuid for now.
-    // pub id: u32,
+    pub position: glam::Vec3,
+    pub orientation: glam::Quat,
+    // this is public but we never send it or modify it (unless a ConnectPacket is received)
+    pub _uuid: [u8; 16],
+}
+
+#[derive(Clone, Default)]
+// used exclusively to internally process update packets;
+// this lacks a uuid field to not waste space,
+// and could likely lack other fields that PlayerData will
+// one day have, such as username.
+pub struct PlayerPositionData {
+    pub position: glam::Vec3,
+    pub orientation: glam::Quat,
 }
 
 impl PlayerData {
-    pub fn new() -> PlayerData {
+    // same as using default():
+    pub fn new(uuid: [u8; 16]) -> PlayerData {
         PlayerData {
             // starting position:
             position: glam::Vec3::new(0f32, 0f32, 0f32),
             orientation: glam::Quat::IDENTITY,
+            _uuid: uuid,
         }
     }
     // to make sure the packet sent back has the same structure
@@ -264,11 +276,12 @@ pub enum ReceiveError {
     NonUpdateEvent { id: Option<u32> },
     // Peer already has a session (sent Hello before); a second Hello is
     // ignored rather than re-identified.
-    AlreadyIdentified { id: u32 },
+    HelloDuplication { id: u32 },
     PlayerNotFound { id: u32 },
     UnreadableDataReceived { id: u32 },
     AssociatedDataNotFound { id: u32 },
     UnreadableHello,
+    UnreadableHelloDataReceived,
 }
 
 pub enum DisconnectError {
