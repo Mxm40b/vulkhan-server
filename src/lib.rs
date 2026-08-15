@@ -216,7 +216,7 @@ fn handle_receive(
                 server_state
                     .players_data
                     .get(&actual_token)
-                    .expect("all peers given token and data on connect")
+                    .ok_or(EventError::ReceiveError(ReceiveError::PeerWithoutToken))?
                     .to_packet_bytes(PacketType::Update),
                 enet::PacketMode::UnreliableSequenced,
             ))
@@ -245,7 +245,11 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
         // function that said to send this can be trusted.
         SendToWhom::ToAllButOne(token, packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
-                if *peer.data().expect("all peers given token on connect") != token {
+                if *peer
+                    .data()
+                    .expect("all peers given token on connect (from send helper)")
+                    != token
+                {
                     match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                         Ok(packet) => match send_helper(&mut peer, packet, packet_mode) {
                             Ok(_) => (),
@@ -257,10 +261,12 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
             });
         }
         SendToWhom::ToOne(token, packet_to_send, packet_mode) => {
-            if let Some(peer) = enet
-                .peers()
-                .find(|peer| *peer.data().expect("all peers given token on connect") == token)
-            {
+            if let Some(peer) = enet.peers().find(|peer| {
+                *peer
+                    .data()
+                    .expect("all peers given token on connect (from send helper 2)")
+                    == token
+            }) {
                 match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                     Ok(packet) => match send_helper(&mut peer.clone(), packet, packet_mode) {
                         Ok(_) => (),
