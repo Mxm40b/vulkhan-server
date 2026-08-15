@@ -15,12 +15,8 @@ pub fn handle_event(
     server_state: &mut ServerState,
 ) -> Result<(), EventError> {
     match event {
-        // ...and immediately send everything to the associated helper function
-        Event::Connect(peer) => handle_connect_request(peer, server_state), // currently the only way to disconnect is if the user has internet connection
-        // and chooses to disconnect.
-        // todo: if a user timeouts, disconnect them.
-        // or does enet do that already? idk
-        Event::Disconnect(_peer, token) => handle_disconnect(server_state, token),
+        Event::Connect(peer) => handle_connect_request(peer, server_state),
+        Event::Disconnect(peer, _reason) => handle_disconnect(server_state, peer),
         Event::Receive {
             sender: peer,
             packet,
@@ -29,106 +25,45 @@ pub fn handle_event(
     }
 }
 
+// A raw ENet connection doesn't get a session id or player data yet -- the
+// peer's user data (`peer.data()`) stays `None` until they send a Hello
+// packet with their UUID (see handle_receive). Any packet other than Hello
+// from an un-identified peer is dropped there.
 fn handle_connect_request(
-    peer: &mut enet::Peer<u32>,
-    server_state: &mut ServerState,
+    _peer: &mut enet::Peer<u32>,
+    _server_state: &mut ServerState,
 ) -> Result<(), EventError> {
-    // tokens are single-use, meaning once a player disconnects,
-    // they lose that token. one day, we will use a permanent uuid too.
-    // therefore we must generate this token on connect no matter the player.
-    let token = generate_token(server_state);
-
-    // the token associated with a player is stored in
-    // the enet::Peer type, and also as a key in the hashmap that stores
-    // players' data.
-    peer.set_data(Some(token));
-    let new_id = server_state.highest_player_id + 1;
-    server_state.highest_player_id = new_id;
-    // id is incremental: 1, 2, 3... note: starts at one because highest_player_id default value is 0.
-    // now if a player quits, and another joins, there will just be an unassigned id.
-    let new_player_data = PlayerData::new(new_id);
-    // Pierre, here you notice that the owner of that data is now the hashmap.
-    // if you try to reuse temp_data later, rust will complain.
-    // see chap 4 of the rust book.
-    server_state
-        .players_data
-        .insert(token, new_player_data.clone());
-    // two messages: one will send to all but the client,
-    // the position data, and one will send only to that client,
-    // their token so that they can use it for later messages.
-    // the client can differentiate between a ShareToken message
-    // and a Join message. one communicates position and token,
-    // the other communicates position and id.
-    server_state.things_to_send.push(SendToWhom::ToAllButOne(
-        token,
-        new_player_data.to_packet_bytes(PacketType::Join),
-        enet::PacketMode::ReliableSequenced,
-    ));
-    // this sends the new player all the old players' data,
-    // and their own position and token.
-    // they know the packet that gives them their token
-    // because in its header is the enum ShareToken.
-    for client in server_state.players_data.values() {
-        match client.id {
-            id if id == new_id => {
-                server_state.things_to_send.push(SendToWhom::ToOne(
-                    token,
-                    // we change the id to the token and reuse the same type of packet
-                    // and this is only sent once per connection,
-                    // and no useless data is shared anyways
-                    new_player_data
-                        .with_id(token)
-                        .to_packet_bytes(PacketType::ShareToken),
-                    enet::PacketMode::ReliableSequenced,
-                ))
-            }
-            _ => server_state.things_to_send.push(SendToWhom::ToOne(
-                token,
-                client.to_packet_bytes(PacketType::NotifyStatusOnConnect),
-                enet::PacketMode::ReliableSequenced,
-            )),
-        }
-    }
     Ok(())
 }
 
-fn handle_disconnect(server_state: &mut ServerState, token: &u32) -> Result<(), EventError> {
-    // send everyone a disconnect Packet
-    if *token == 0 {
-        // ENet clears a peer's user data to 0 on a forced/abrupt reset
-        // (as opposed to a graceful disconnect), so a Disconnect event
-        // can arrive with no real token attached. 0 was never handed out
-        // by generate_token(), so treat it as "nothing to clean up".
-        //
-        // is there no data associated to that player, still stored in
-        // players_data ? if so, should we ignore the memory leak?
-        // idea: run a repair function for every (number of players) iterations of the loop,
-        // that checks the number of players for whom we have data, the number of peers,
-        // and if they mismatch, hunt for the extra data or the peer that didn't fully connect/disconnect
-        // or other approach: match every peer for every piece of data stored in the hashmap,
-        // and disconnect/delete all that don't have a match.
-        // but need to think about possible attacks.
-        return Err(EventError::DisconnectError(DisconnectError::InvalidToken));
-    }
+fn handle_disconnect(
+    server_state: &mut ServerState,
+    peer: &mut enet::Peer<u32>,
+) -> Result<(), EventError> {
+    // Note: this reads the peer's own persistent session id via
+    // `peer.data()`. It is *not* the same as the `u32` the Event::Disconnect
+    // variant also carries -- that second field is the disconnect *reason*
+    // code passed to enet_peer_disconnect(peer, reason) by whichever side
+    // requested the disconnect, unrelated to who the peer is. The client
+    // always passes 0 for that reason, so reading it as if it were the
+    // session id meant this function always saw `id == 0` and never
+    // actually cleaned up a disconnecting player.
+    let Some(&id) = peer.data() else {
+        // Never sent a Hello (or was force-reset before/without ever being
+        // identified) -- nothing to clean up.
+        return Err(EventError::DisconnectError(DisconnectError::InvalidId));
+    };
 
     let player = server_state
         .players_data
-        .get(token)
-        .ok_or(EventError::DisconnectError(DisconnectError::NoDataStored {
-            token: *token,
-        }))?;
-    // {
-    //     eprintln!(
-    //         "warning: player with token `{token}` disconnected but no player data was stored for it, ignoring"
-    //     );
-    //     return Err(EventError::DisconnectError(DisconnectError::NoDataStored));
-    // };
-    // send everyone a disconnect Packet
+        .get(&id)
+        .ok_or(EventError::DisconnectError(DisconnectError::NoDataStored { id }))?;
+
     server_state.things_to_send.push(SendToWhom::ToAll(
         player.to_packet_bytes(PacketType::Leave),
         enet::PacketMode::ReliableSequenced,
     ));
-    server_state.players_data.remove(token);
+    server_state.players_data.remove(&id);
     Ok(())
 }
 
@@ -137,85 +72,61 @@ fn handle_receive(
     peer: &mut enet::Peer<u32>,
     packet: &mut enet::Packet,
 ) -> Result<(), EventError> {
-    // TODO: peers could not have a token if they just connected, but we didn't handle that event yet.
-    // should fix that and accept that some peers might not have a token, in which case we ignore them.
-    // token is stored in the enet::Peer type itself
-    //
-    // // TODO: turn the if let pyramid into a let Ok(value) else {return (error string)}; //rest of code
-    // then turn the error strings into error tuples, flatten with ? and .ok_or() method
-    // and create an error tuple handling function to call from main.rs
-    let actual_token = *peer
-        .data()
-        .ok_or(EventError::ReceiveError(ReceiveError::PeerWithoutToken))?;
-    let Ok((header, _training_data)) = PacketHeader::ref_from_prefix(packet.data()) else {
-        // if the player sends invalid packets, we ignore it for now. Might want more complex behaviour later on.
+    let peer_id: Option<u32> = peer.data().copied();
+
+    let Ok((header, _trailing_data)) = PacketHeader::ref_from_prefix(packet.data()) else {
         return Err(EventError::ReceiveError(ReceiveError::InvalidHeader {
-            token: actual_token,
+            id: peer_id.unwrap_or(0),
         }));
     };
 
     let packet_type = PacketType::from_u8(header.packet_type).ok_or(EventError::ReceiveError(
         ReceiveError::UnreadableHeader {
-            token: actual_token,
+            id: peer_id.unwrap_or(0),
         },
     ))?;
 
+    if packet_type == PacketType::Hello {
+        return handle_hello(server_state, peer, packet);
+    }
+
+    // Every other packet type requires an already-identified peer; anyone
+    // who hasn't sent their Hello yet is silently ignored, per design.
+    let actual_id = peer_id.ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?;
+
     match packet_type {
-        PacketType::Join
-        | PacketType::Leave
-        | PacketType::NotifyStatusOnConnect
-        | PacketType::ShareToken => {
+        PacketType::Join | PacketType::Leave | PacketType::Hello => {
             return Err(EventError::ReceiveError(ReceiveError::NonUpdateEvent {
-                token: actual_token,
+                id: actual_id,
             }));
         }
         PacketType::Update => {
-            let (packet, _trailing_data) = UpdatePacket::ref_from_prefix(packet.data()).map_err(
-                // if the player sends invalid packets, we ignore it for now. Might want more complex behaviour later on.
-                // eprintln!(
-                //     "Peer {:?} with connect token `{}` sent invalid packets.",
-                //     peer, actual_token
-                // );
-                |_| {
-                    EventError::ReceiveError(ReceiveError::UnreadableDataReceived {
-                        token: actual_token,
-                    })
-                },
+            let (packet, _trailing_data) = UpdatePacket::ref_from_prefix(packet.data())
+                .map_err(|_| {
+                    EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id: actual_id })
+                })?;
+
+            // The client no longer sends a meaningful id on Update packets --
+            // we already know who this is from the connection itself.
+            server_state
+                .players_data
+                .get(&actual_id)
+                .ok_or(EventError::ReceiveError(ReceiveError::AssociatedDataNotFound {
+                    id: actual_id,
+                }))?;
+
+            let new_data = Packet::to_data(Packet::Update(*packet), actual_id).ok_or(
+                EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id: actual_id }),
             )?;
 
-            let claimed_token = packet.header.id;
-            if claimed_token != actual_token {
-                return Err(EventError::ReceiveError(ReceiveError::TokenMismatch {
-                    expected: actual_token,
-                    got: claimed_token,
-                }));
-            };
+            server_state.players_data.insert(actual_id, new_data);
 
-            let old_data =
-                server_state
-                    .players_data
-                    .get(&actual_token)
-                    .ok_or(EventError::ReceiveError(
-                        ReceiveError::AssociatedDataNotFound {
-                            token: actual_token,
-                        },
-                    ))?;
-
-            let new_data = Packet::to_data(Packet::Update(*packet), old_data.id).ok_or(
-                EventError::ReceiveError(ReceiveError::UnreadableDataReceived {
-                    token: actual_token,
-                }),
-            )?;
-
-            server_state.players_data.insert(packet.header.id, new_data);
-            // send update to all players
-            // TODO: turn the following expect into an error to return, to not crash the server
             server_state.things_to_send.push(SendToWhom::ToAllButOne(
-                actual_token,
+                actual_id,
                 server_state
                     .players_data
-                    .get(&actual_token)
-                    .ok_or(EventError::ReceiveError(ReceiveError::PeerWithoutToken))?
+                    .get(&actual_id)
+                    .ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?
                     .to_packet_bytes(PacketType::Update),
                 enet::PacketMode::UnreliableSequenced,
             ))
@@ -224,13 +135,61 @@ fn handle_receive(
     Ok(())
 }
 
+// Handles a client's one-time Hello: assigns them a session id, registers
+// their player data, tells everyone else they joined, and dumps the
+// existing players' state back to them (reusing the Join wire format --
+// the client treats Join and this dump identically).
+fn handle_hello(
+    server_state: &mut ServerState,
+    peer: &mut enet::Peer<u32>,
+    packet: &mut enet::Packet,
+) -> Result<(), EventError> {
+    if let Some(&existing_id) = peer.data() {
+        // Already identified; a repeated Hello is ignored rather than
+        // re-assigning a new session id out from under them.
+        return Err(EventError::ReceiveError(ReceiveError::AlreadyIdentified {
+            id: existing_id,
+        }));
+    }
+
+    let Ok((_hello, _trailing_data)) = HelloPacket::ref_from_prefix(packet.data()) else {
+        return Err(EventError::ReceiveError(ReceiveError::UnreadableHello));
+    };
+    // `_hello.uuid` is the client's persistent identity. We don't yet key
+    // anything off it server-side (no reconnect/database support), but it's
+    // parsed and validated here so that's a drop-in addition later.
+
+    let new_id = generate_session_id(server_state);
+    peer.set_data(Some(new_id));
+
+    let new_player_data = PlayerData::new(new_id);
+    server_state
+        .players_data
+        .insert(new_id, new_player_data.clone());
+
+    server_state.things_to_send.push(SendToWhom::ToAllButOne(
+        new_id,
+        new_player_data.to_packet_bytes(PacketType::Join),
+        enet::PacketMode::ReliableSequenced,
+    ));
+
+    for existing in server_state.players_data.values() {
+        if existing.id == new_id {
+            continue;
+        }
+        server_state.things_to_send.push(SendToWhom::ToOne(
+            new_id,
+            existing.to_packet_bytes(PacketType::Join),
+            enet::PacketMode::ReliableSequenced,
+        ));
+    }
+
+    Ok(())
+}
+
 // because there is a send list with kinds of messages to send, this one sends all,
 // from the main thread
 pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result<(), SendError> {
-    // TODO: instead of printing errors, get them out of the closures and return them,
-    // for the caller to handle them
-    //
-    // two types of messages to send: only to one client, or to all (eg updates)
     match to_do {
         SendToWhom::ToAll(packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
@@ -245,13 +204,14 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
         }
         // in this case, we do not check that this user exists, we assume
         // function that said to send this can be trusted.
-        SendToWhom::ToAllButOne(token, packet_to_send, packet_mode) => {
+        SendToWhom::ToAllButOne(id, packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
-                let Some(&receiver_token) = peer.data() else {
-                    eprintln!("error: sending to all, peer without token");
+                let Some(&receiver_id) = peer.data() else {
+                    // un-identified peers haven't sent Hello yet -- they get
+                    // nothing until they do.
                     return;
                 };
-                if receiver_token != token {
+                if receiver_id != id {
                     match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                         Ok(packet) => match send_helper(&mut peer, packet, packet_mode) {
                             Ok(_) => (),
@@ -262,13 +222,12 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
                 }
             });
         }
-        SendToWhom::ToOne(token, packet_to_send, packet_mode) => {
+        SendToWhom::ToOne(id, packet_to_send, packet_mode) => {
             if let Some(peer) = enet.peers().find(|peer| {
-                let Some(&receiver_token) = peer.data() else {
-                    eprintln!("error: sending to one, peer without token");
+                let Some(&receiver_id) = peer.data() else {
                     return false;
                 };
-                receiver_token == token
+                receiver_id == id
             }) {
                 match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                     Ok(packet) => match send_helper(&mut peer.clone(), packet, packet_mode) {
@@ -285,8 +244,8 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
                 }
             } else {
                 eprintln!(
-                    "error: tried to send data to peer with token {} but no such peer was found.",
-                    token
+                    "error: tried to send data to peer with session id {} but no such peer was found.",
+                    id
                 )
             }
         }
@@ -296,74 +255,57 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
 
 pub fn handle_event_error(e: EventError) {
     match e {
-        EventError::ConnectError(e) => match e {
-            ConnectError::PeerWithoutToken => {
-                eprintln!("error: on connect, peer without token")
-            }
-            ConnectError::NewPlayerWithoutData { token } => {
-                eprintln!(
-                    "error: player with token `{}` that just connected does not have any associated data. \nEither the token was improperly handled or the data was not created.",
-                    token
-                )
-            }
-        },
         EventError::DisconnectError(e) => match e {
-            DisconnectError::InvalidToken => {
+            DisconnectError::InvalidId => {
                 eprintln!(
-                    "error: a disconnecting ting peer has an invalid token stored of value 0 its an error P talked about, i don't understand it."
+                    "note: a disconnecting peer had no session id (never sent Hello, or was force-reset)."
                 )
             }
-            DisconnectError::NoDataStored { token } => {
-                eprintln!(
-                    "error: peer with token `{}` had no associated data stored.",
-                    token
-                )
+            DisconnectError::NoDataStored { id } => {
+                eprintln!("error: peer with session id `{}` had no associated data stored.", id)
             }
         },
         EventError::ReceiveError(e) => match e {
-            ReceiveError::InvalidHeader { token } => {
+            ReceiveError::PeerNotIdentified => {
                 eprintln!(
-                    "error: peer with token `{}` sent a header of invalid length.",
-                    token
-                );
-            }
-            ReceiveError::UnreadableHeader { token } => {
-                eprintln!(
-                    "error: could not read packet type from the packet header sent by player with token `{}`",
-                    token
-                );
-            }
-            ReceiveError::NonUpdateEvent { token } => {
-                eprintln!(
-                    "error: received a packet of non-update type from player with token `{} when enet gave a Receive event; packet types other than update not handled for now.",
-                    token
-                );
-            }
-            ReceiveError::TokenMismatch { expected, got } => {
-                eprintln!(
-                    "warning: Peer with expected connect token `{}` sent mismatching token `{}` instead.",
-                    expected, got
-                );
-            }
-            ReceiveError::PlayerNotFound { token } => {
-                eprintln!("error: could not get data from Peer with token `{}`", token);
-            }
-            ReceiveError::UnreadableDataReceived { token } => {
-                eprintln!(
-                    "error: data sent by peer with token `{}` could not be read!",
-                    token
-                );
-            }
-            ReceiveError::AssociatedDataNotFound { token } => {
-                eprintln!(
-                    "error: could not get data from player with token `{}`; need to investigate this.",
-                    token
+                    "note: dropped a packet from a peer that hasn't sent its Hello yet."
                 )
             }
-            ReceiveError::PeerWithoutToken => {
+            ReceiveError::InvalidHeader { id } => {
+                eprintln!("error: peer `{}` sent a header of invalid length.", id);
+            }
+            ReceiveError::UnreadableHeader { id } => {
                 eprintln!(
-                    "error: all enet::Peer should have a token, they were given one on connect. And yet..."
+                    "error: could not read packet type from the packet header sent by peer `{}`",
+                    id
+                );
+            }
+            ReceiveError::NonUpdateEvent { id } => {
+                eprintln!(
+                    "error: received a packet of non-update type from peer `{}`; only Update and Hello are valid from a client.",
+                    id
+                );
+            }
+            ReceiveError::AlreadyIdentified { id } => {
+                eprintln!(
+                    "note: peer `{}` sent a second Hello after already being identified; ignored.",
+                    id
+                );
+            }
+            ReceiveError::PlayerNotFound { id } => {
+                eprintln!("error: could not get data from peer with session id `{}`", id);
+            }
+            ReceiveError::UnreadableDataReceived { id } => {
+                eprintln!("error: data sent by peer `{}` could not be read!", id);
+            }
+            ReceiveError::AssociatedDataNotFound { id } => {
+                eprintln!(
+                    "error: could not get data from player with session id `{}`; need to investigate this.",
+                    id
                 )
+            }
+            ReceiveError::UnreadableHello => {
+                eprintln!("error: received a malformed Hello packet, ignoring it.")
             }
         },
     }

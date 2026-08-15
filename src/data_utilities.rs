@@ -6,20 +6,17 @@ use std::collections::HashMap;
 
 #[derive(PartialEq, Debug)]
 pub enum PacketType {
-    // sent to tell players that are already/still here who joined/left:
+    // sent to tell players that are already/still here who joined/left,
+    // and also reused server-side to dump existing players' state to a
+    // freshly-identified client (the wire bytes are identical either way,
+    // and the client treats them identically too):
     Join,
     Leave,
     Update,
-    // serves to share token and spawn position on connect:
-    // todo: send that player a different kind of packet that contains an additional field
-    // to have both id and token.
-    // to do that, we will split into two categories of packets: connect response packets / information packets, and position packets.
-    // the position packets will still reuse the id one way to send tokens, and the other to give only the player id
-    // the information packets will contain a packet type header, an id and a token. more fields may be added, in which case they will be
-    // default values when unneeded, given that they will not be sent very often this is an acceptable compromise for simplicity.
-    ShareToken,
-    // serves to tell the players who were already on the server:
-    NotifyStatusOnConnect,
+    // sent once by the client, right after connecting, carrying its
+    // persistent UUID. The server assigns a session id in response to this
+    // and never needs to send it back to the client (see HelloPacket).
+    Hello,
 }
 
 #[derive(Clone)]
@@ -35,8 +32,7 @@ impl PacketType {
             0 => Some(PacketType::Join),
             1 => Some(PacketType::Leave),
             2 => Some(PacketType::Update),
-            3 => Some(PacketType::ShareToken),
-            4 => Some(PacketType::NotifyStatusOnConnect),
+            3 => Some(PacketType::Hello),
             _ => None,
         }
     }
@@ -45,8 +41,7 @@ impl PacketType {
             Self::Join => 0,
             Self::Leave => 1,
             Self::Update => 2,
-            Self::ShareToken => 3,
-            Self::NotifyStatusOnConnect => 4,
+            Self::Hello => 3,
         }
     }
 }
@@ -75,16 +70,28 @@ pub struct PacketHeader {
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct UpdatePacket {
     pub header: PacketHeader,
-    // can be both token and user id depending on context
     pub position: [f32; 3],
     pub orientation: [f32; 4],
+}
+
+// Sent by the client, once, right after connecting. Not part of the
+// Join/Leave/Update wire format above -- this is its own 17-byte shape.
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct HelloPacket {
+    pub packet_type: u8,
+    pub uuid: [u8; 16],
 }
 
 impl Packet {
     // convert a packet to usable data
     // because they are not interchangeable in rust
+    //
+    // `id` is the session id the server has already assigned this peer
+    // (from its Hello handshake) -- we no longer trust an id field the
+    // client sends us on every packet, since the client doesn't send one
+    // anymore.
     pub fn to_data(self, id: u32) -> Option<PlayerData> {
-        // TODO: make this return a Result<PlayerData, Error> so that calling code handles it
         match self {
             Packet::Update(UpdatePacket {
                 header,
@@ -137,12 +144,16 @@ impl PlayerData {
     // as the one received, we insert everything into the
     // correctly laid-out in memory
     // Packet type then take it as bytes
+    //
+    // Join/Update go out as the full 33-byte UpdatePacket shape (position +
+    // orientation are meaningful for both). Leave only needs the 5-byte
+    // header -- there's no point spending 28 extra bytes telling everyone
+    // where a player was standing when they left. The client parses the
+    // header first and only reads the rest for types that need it (see
+    // NetworkSession::poll on the client).
     pub fn to_packet_bytes(&self, packet_type: PacketType) -> Vec<u8> {
         match packet_type {
-            PacketType::Update
-            | PacketType::Join
-            | PacketType::NotifyStatusOnConnect
-            | PacketType::ShareToken => UpdatePacket {
+            PacketType::Join | PacketType::Update => UpdatePacket {
                 header: PacketHeader {
                     packet_type: packet_type.to_u8(),
                     id: self.id,
@@ -152,15 +163,15 @@ impl PlayerData {
             }
             .as_bytes()
             .to_vec(),
-            // only sending header with player id when a player disconnects instead of everything
-            // P, notice this code: all types of packets send position, see PacketType enum for more comments,
-            // except for Leave which does not need to send position.
             PacketType::Leave => PacketHeader {
                 packet_type: packet_type.to_u8(),
                 id: self.id,
             }
             .as_bytes()
             .to_vec(),
+            PacketType::Hello => {
+                unreachable!("Hello is only ever sent by the client, never by the server")
+            }
         }
     }
     pub fn with_id(&self, id: u32) -> Self {
@@ -168,11 +179,14 @@ impl PlayerData {
     }
 }
 
-pub fn generate_token(server_state: &ServerState) -> u32 {
+// Generates a fresh, unique session id for a newly-identified player. Called
+// once a client's Hello (with its UUID) has been received -- not on raw
+// connect, since an un-identified peer doesn't have a session yet.
+pub fn generate_session_id(server_state: &ServerState) -> u32 {
     loop {
-        let token = rand::random::<u32>(); // thank you, rand crate!
-        if token != 0 && !server_state.players_data.contains_key(&token) {
-            return token;
+        let id = rand::random::<u32>();
+        if id != 0 && !server_state.players_data.contains_key(&id) {
+            return id;
         }
     }
 }
@@ -182,47 +196,34 @@ pub struct ServerState {
     pub players_data: HashMap<u32, PlayerData>,
 
     pub things_to_send: Vec<SendToWhom>,
-
-    pub highest_player_id: u32,
 }
-
-// impl ServerState {
-//     pub fn new() -> Self {
-//         Self {
-//             players_data: HashMap::new(),
-//             things_to_send: Vec::new(),
-//         }
-//     }
-// }
 
 pub enum ReceiveError {
-    // InvalidPacketData,
-    PeerWithoutToken,
-    InvalidHeader { token: u32 },
-    UnreadableHeader { token: u32 },
-    NonUpdateEvent { token: u32 },
-    TokenMismatch { expected: u32, got: u32 },
-    PlayerNotFound { token: u32 },
-    UnreadableDataReceived { token: u32 },
-    AssociatedDataNotFound { token: u32 },
+    // Peer sent something before we'd received its Hello / assigned it a
+    // session id yet -- dropped, not an error worth surfacing loudly.
+    PeerNotIdentified,
+    InvalidHeader { id: u32 },
+    UnreadableHeader { id: u32 },
+    NonUpdateEvent { id: u32 },
+    // Peer already has a session (sent Hello before); a second Hello is
+    // ignored rather than re-identified.
+    AlreadyIdentified { id: u32 },
+    PlayerNotFound { id: u32 },
+    UnreadableDataReceived { id: u32 },
+    AssociatedDataNotFound { id: u32 },
+    UnreadableHello,
 }
-pub enum ConnectError {
-    NewPlayerWithoutData { token: u32 },
-    PeerWithoutToken,
-}
-// only adding for structure now, if error cases are discovered,
 
 pub enum DisconnectError {
-    InvalidToken,
-    NoDataStored { token: u32 },
+    InvalidId,
+    NoDataStored { id: u32 },
 }
 
 pub enum EventError {
     ReceiveError(ReceiveError),
-    ConnectError(ConnectError),
     DisconnectError(DisconnectError),
 }
 
 pub enum SendError {
-    PeerWithoutToken,
+    PeerWithoutId,
 }
