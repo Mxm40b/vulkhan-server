@@ -205,7 +205,10 @@ pub enum ReceiveError {
     UnreadableDataReceived { token: u32 },
     AssociatedDataNotFound { token: u32 },
 }
-pub enum ConnectError {}
+pub enum ConnectError {
+    NewPlayerWithoutData { token: u32 },
+    PeerWithoutToken,
+}
 // only adding for structure now, if error cases are discovered,
 
 pub enum DisconnectError {
@@ -217,4 +220,8 @@ pub enum EventError {
     ReceiveError(ReceiveError),
     ConnectError(ConnectError),
     DisconnectError(DisconnectError),
+}
+
+pub enum SendError {
+    PeerWithoutToken,
 }

@@ -51,10 +51,11 @@ fn handle_connect_request(
     // if you try to reuse temp_data later, rust will complain.
     // see chap 4 of the rust book.
     server_state.players_data.insert(token, temp_data);
-    let new_player = &server_state
-        .players_data
-        .get(&token)
-        .expect("this player exists; they were just created");
+    let Some(new_player) = &server_state.players_data.get(&token) else {
+        return Err(EventError::ConnectError(
+            ConnectError::NewPlayerWithoutData { token },
+        ));
+    };
     // two messages: one will send to all but the client,
     // the position data, and one will send only to that client,
     // their token so that they can use it for later messages.
@@ -70,17 +71,19 @@ fn handle_connect_request(
     for client in server_state.players_data.values() {
         match client.id {
             id if id == new_id => {
+                let Some(data_to_send) = server_state.players_data.get(&token) else {
+                    return Err(EventError::ConnectError(ConnectError::PeerWithoutToken));
+                };
                 server_state.things_to_send.push(SendToWhom::ToOne(
                     token,
-                    server_state.players_data
-                        .get(&token)
-                        .expect("we are certain this player has a token since they were given one upon connect")
-                        // we change the id to the token and reuse the same type of packet
-                        // because we are lazy
-                        // and this is only sent once per connection,
-                        // and no useless data is shared anyways
+                    // we change the id to the token and reuse the same type of packet
+                    // because we are lazy
+                    // and this is only sent once per connection,
+                    // and no useless data is shared anyways
+                    data_to_send
                         .with_id(token)
-                        .to_packet_bytes(PacketType::ShareToken),enet::PacketMode::ReliableSequenced
+                        .to_packet_bytes(PacketType::ShareToken),
+                    enet::PacketMode::ReliableSequenced,
                 ))
             }
             _ => server_state.things_to_send.push(SendToWhom::ToOne(
@@ -227,7 +230,10 @@ fn handle_receive(
 
 // because there is a send list with kinds of messages to send, this one sends all,
 // from the main thread
-pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
+pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result<(), SendError> {
+    // TODO: instead of printing errors, get them out of the closures and return them,
+    // for the caller to handle them
+    //
     // two types of messages to send: only to one client, or to all (eg updates)
     match to_do {
         SendToWhom::ToAll(packet_to_send, packet_mode) => {
@@ -245,11 +251,11 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
         // function that said to send this can be trusted.
         SendToWhom::ToAllButOne(token, packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
-                if *peer
-                    .data()
-                    .expect("all peers given token on connect (from send helper)")
-                    != token
-                {
+                let Some(&receiver_token) = peer.data() else {
+                    eprintln!("error: peer without token");
+                    return;
+                };
+                if receiver_token != token {
                     match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                         Ok(packet) => match send_helper(&mut peer, packet, packet_mode) {
                             Ok(_) => (),
@@ -262,10 +268,11 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
         }
         SendToWhom::ToOne(token, packet_to_send, packet_mode) => {
             if let Some(peer) = enet.peers().find(|peer| {
-                *peer
-                    .data()
-                    .expect("all peers given token on connect (from send helper 2)")
-                    == token
+                let Some(&receiver_token) = peer.data() else {
+                    eprintln!("error: peer without token");
+                    return false;
+                };
+                receiver_token == token
             }) {
                 match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                     Ok(packet) => match send_helper(&mut peer.clone(), packet, packet_mode) {
@@ -287,13 +294,22 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
                 )
             }
         }
-    }
+    };
+    Ok(())
 }
 
 pub fn handle_event_error(e: EventError) {
     match e {
         EventError::ConnectError(e) => match e {
-            // no connect errors for now
+            ConnectError::PeerWithoutToken => {
+                eprintln!("error: peer without token")
+            }
+            ConnectError::NewPlayerWithoutData { token } => {
+                eprintln!(
+                    "error: player with token `{}` that just connected does not have any associated data. \nEither the token was improperly handled or the data was not created.",
+                    token
+                )
+            }
         },
         EventError::DisconnectError(e) => match e {
             DisconnectError::InvalidToken => {
