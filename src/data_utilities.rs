@@ -167,7 +167,7 @@ impl PlayerData {
     }
 }
 
-pub fn generate_token(server_state: ServerState) -> u32 {
+pub fn generate_token(server_state: &ServerState) -> u32 {
     loop {
         let token = rand::random::<u32>(); // thank you, rand crate!
         if token != 0 && !server_state.players_data.contains_key(&token) {

@@ -36,7 +36,7 @@ fn handle_connect_request(
     // tokens are single-use, meaning once a player disconnects,
     // they lose that token. one day, we will use a permanent uuid too.
     // therefore we must generate this token on connect no matter the player.
-    let token = generate_token();
+    let token = generate_token(server_state);
 
     // the token associated with a player is stored in
     // the enet::Peer type, and also as a key in the hashmap that stores
