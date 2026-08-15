@@ -196,6 +196,7 @@ pub struct ServerState {
 
 pub enum ReceiveError {
     // InvalidPacketData,
+    PeerWithoutToken,
     InvalidHeader { token: u32 },
     UnreadableHeader { token: u32 },
     NonUpdateEvent { token: u32 },

@@ -145,7 +145,9 @@ fn handle_receive(
     // // TODO: turn the if let pyramid into a let Ok(value) else {return (error string)}; //rest of code
     // then turn the error strings into error tuples, flatten with ? and .ok_or() method
     // and create an error tuple handling function to call from main.rs
-    let actual_token = *peer.data().expect("all peers given token on connect");
+    let actual_token = *peer
+        .data()
+        .ok_or(EventError::ReceiveError(ReceiveError::PeerWithoutToken))?;
     let Ok((header, _training_data)) = PacketHeader::ref_from_prefix(packet.data()) else {
         // if the player sends invalid packets, we ignore it for now. Might want more complex behaviour later on.
         return Err(EventError::ReceiveError(ReceiveError::InvalidHeader {
