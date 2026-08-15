@@ -30,9 +30,12 @@ pub fn handle_event(
 // packet with their UUID (see handle_receive). Any packet other than Hello
 // from an un-identified peer is dropped there.
 fn handle_connect_request(
-    _peer: &mut enet::Peer<u32>,
-    _server_state: &mut ServerState,
+    peer: &mut enet::Peer<u32>,
+    server_state: &mut ServerState,
 ) -> Result<(), EventError> {
+    let id = generate_session_id(server_state);
+    peer.set_data(Some(id));
+    server_state.players_data.insert(id, PlayerData::new());
     Ok(())
 }
 
@@ -57,10 +60,12 @@ fn handle_disconnect(
     let player = server_state
         .players_data
         .get(&id)
-        .ok_or(EventError::DisconnectError(DisconnectError::NoDataStored { id }))?;
+        .ok_or(EventError::DisconnectError(DisconnectError::NoDataStored {
+            id,
+        }))?;
 
     server_state.things_to_send.push(SendToWhom::ToAll(
-        player.to_packet_bytes(PacketType::Leave),
+        player.to_packet_bytes(PacketType::Leave, id),
         enet::PacketMode::ReliableSequenced,
     ));
     server_state.players_data.remove(&id);
@@ -76,14 +81,12 @@ fn handle_receive(
 
     let Ok((header, _trailing_data)) = PacketHeader::ref_from_prefix(packet.data()) else {
         return Err(EventError::ReceiveError(ReceiveError::InvalidHeader {
-            id: peer_id.unwrap_or(0),
+            id: peer_id,
         }));
     };
 
     let packet_type = PacketType::from_u8(header.packet_type).ok_or(EventError::ReceiveError(
-        ReceiveError::UnreadableHeader {
-            id: peer_id.unwrap_or(0),
-        },
+        ReceiveError::UnreadableHeader { id: peer_id },
     ))?;
 
     if packet_type == PacketType::Hello {
@@ -92,42 +95,49 @@ fn handle_receive(
 
     // Every other packet type requires an already-identified peer; anyone
     // who hasn't sent their Hello yet is silently ignored, per design.
-    let actual_id = peer_id.ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?;
 
     match packet_type {
-        PacketType::Join | PacketType::Leave | PacketType::Hello => {
+        // TODO: handle the Hello type
+        PacketType::Hello => {
+            eprintln!("warning: ignoring hello packet")
+        }
+        PacketType::Join | PacketType::Leave | PacketType::PropagateUpdate | PacketType::Spawn => {
             return Err(EventError::ReceiveError(ReceiveError::NonUpdateEvent {
-                id: actual_id,
+                id: peer_id,
             }));
         }
         PacketType::Update => {
-            let (packet, _trailing_data) = UpdatePacket::ref_from_prefix(packet.data())
-                .map_err(|_| {
-                    EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id: actual_id })
+            let id = peer_id.ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?;
+            let (packet, _trailing_data) =
+                UpdatePacket::ref_from_prefix(packet.data()).map_err(|_| {
+                    EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id })
                 })?;
 
             // The client no longer sends a meaningful id on Update packets --
             // we already know who this is from the connection itself.
+            //
+            // we make sure that the player has associated data:
             server_state
                 .players_data
-                .get(&actual_id)
-                .ok_or(EventError::ReceiveError(ReceiveError::AssociatedDataNotFound {
-                    id: actual_id,
-                }))?;
+                .get(&id)
+                .ok_or(EventError::ReceiveError(
+                    ReceiveError::AssociatedDataNotFound { id },
+                ))?;
 
-            let new_data = Packet::to_data(Packet::Update(*packet), actual_id).ok_or(
-                EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id: actual_id }),
+            let new_data = Packet::to_data(Packet::Update(*packet)).ok_or(
+                EventError::ReceiveError(ReceiveError::UnreadableDataReceived { id }),
             )?;
 
-            server_state.players_data.insert(actual_id, new_data);
+            // new_data.0 is the id, and we already have it
+            server_state.players_data.insert(id, new_data);
 
             server_state.things_to_send.push(SendToWhom::ToAllButOne(
-                actual_id,
+                id,
                 server_state
                     .players_data
-                    .get(&actual_id)
+                    .get(&id)
                     .ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?
-                    .to_packet_bytes(PacketType::Update),
+                    .to_packet_bytes(PacketType::PropagateUpdate, id),
                 enet::PacketMode::UnreliableSequenced,
             ))
         }
@@ -162,27 +172,38 @@ fn handle_hello(
     let new_id = generate_session_id(server_state);
     peer.set_data(Some(new_id));
 
-    let new_player_data = PlayerData::new(new_id);
+    let new_player_data = PlayerData::new();
     server_state
         .players_data
         .insert(new_id, new_player_data.clone());
 
     server_state.things_to_send.push(SendToWhom::ToAllButOne(
         new_id,
-        new_player_data.to_packet_bytes(PacketType::Join),
+        new_player_data.to_packet_bytes(PacketType::Join, new_id),
         enet::PacketMode::ReliableSequenced,
     ));
 
-    for existing in server_state.players_data.values() {
-        if existing.id == new_id {
-            continue;
-        }
-        server_state.things_to_send.push(SendToWhom::ToOne(
-            new_id,
-            existing.to_packet_bytes(PacketType::Join),
-            enet::PacketMode::ReliableSequenced,
-        ));
-    }
+    server_state.things_to_send.push(SendToWhom::ToOne(
+        new_id,
+        new_player_data.to_packet_bytes(PacketType::Spawn, new_id),
+        enet::PacketMode::ReliableSequenced,
+    ));
+
+    server_state
+        .players_data
+        .iter()
+        // idk why need to deref twice but it works:
+        // this line is to not send to the user that just connected, their own data, we just did that:
+        .filter(|(key, _value)| (**key) != new_id)
+        .map(|(&key, existing_player)| {
+            server_state.things_to_send.push(SendToWhom::ToOne(
+                new_id,
+                existing_player.to_packet_bytes(PacketType::Join, key),
+                enet::PacketMode::ReliableSequenced,
+            ));
+        })
+        // consumes the iterator:
+        .for_each(drop);
 
     Ok(())
 }
@@ -262,30 +283,38 @@ pub fn handle_event_error(e: EventError) {
                 )
             }
             DisconnectError::NoDataStored { id } => {
-                eprintln!("error: peer with session id `{}` had no associated data stored.", id)
+                eprintln!(
+                    "error: peer with session id `{}` had no associated data stored.",
+                    id
+                )
             }
         },
         EventError::ReceiveError(e) => match e {
             ReceiveError::PeerNotIdentified => {
-                eprintln!(
-                    "note: dropped a packet from a peer that hasn't sent its Hello yet."
-                )
+                eprintln!("note: dropped a packet from a peer that hasn't sent its Hello yet.")
             }
-            ReceiveError::InvalidHeader { id } => {
-                eprintln!("error: peer `{}` sent a header of invalid length.", id);
-            }
-            ReceiveError::UnreadableHeader { id } => {
-                eprintln!(
+            ReceiveError::InvalidHeader { id } => match id {
+                Some(id) => eprintln!("error: peer `{}` sent a header of invalid length.", id),
+                None => eprintln!("error: peer of unknown id sent a header of invalid length."),
+            },
+            ReceiveError::UnreadableHeader { id } => match id {
+                Some(id) => eprintln!(
                     "error: could not read packet type from the packet header sent by peer `{}`",
                     id
-                );
-            }
-            ReceiveError::NonUpdateEvent { id } => {
-                eprintln!(
+                ),
+                None => eprintln!(
+                    "error: could not read packet type from the packet header sent by peer with unknown id"
+                ),
+            },
+            ReceiveError::NonUpdateEvent { id } => match id {
+                Some(id) => eprintln!(
                     "error: received a packet of non-update type from peer `{}`; only Update and Hello are valid from a client.",
                     id
-                );
-            }
+                ),
+                None => eprintln!(
+                    "error: received a packet of non-update type from peer with unknown id; only Update and Hello are valid from a client."
+                ),
+            },
             ReceiveError::AlreadyIdentified { id } => {
                 eprintln!(
                     "note: peer `{}` sent a second Hello after already being identified; ignored.",
@@ -293,7 +322,10 @@ pub fn handle_event_error(e: EventError) {
                 );
             }
             ReceiveError::PlayerNotFound { id } => {
-                eprintln!("error: could not get data from peer with session id `{}`", id);
+                eprintln!(
+                    "error: could not get data from peer with session id `{}`",
+                    id
+                );
             }
             ReceiveError::UnreadableDataReceived { id } => {
                 eprintln!("error: data sent by peer `{}` could not be read!", id);

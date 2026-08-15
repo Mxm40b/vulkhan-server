@@ -17,6 +17,13 @@ pub enum PacketType {
     // persistent UUID. The server assigns a session id in response to this
     // and never needs to send it back to the client (see HelloPacket).
     Hello,
+    // this type serves to share updates received by server with others.
+    // ignore the lies told above, this type of packet holds an id
+    // while the Update does not.
+    PropagateUpdate,
+    // this type is used to inform the player of where they spawn, because the
+    // server decides this (the server remembers where the player logged off)
+    Spawn,
 }
 
 #[derive(Clone)]
@@ -33,6 +40,8 @@ impl PacketType {
             1 => Some(PacketType::Leave),
             2 => Some(PacketType::Update),
             3 => Some(PacketType::Hello),
+            4 => Some(PacketType::PropagateUpdate),
+            5 => Some(PacketType::Spawn),
             _ => None,
         }
     }
@@ -42,6 +51,8 @@ impl PacketType {
             Self::Leave => 1,
             Self::Update => 2,
             Self::Hello => 3,
+            Self::PropagateUpdate => 4,
+            Self::Spawn => 5,
         }
     }
 }
@@ -57,30 +68,63 @@ impl PacketType {
 pub enum Packet {
     Update(UpdatePacket),
     Header(PacketHeader),
+    Hello(HelloPacket),
+    Leave(LeavePacket),
+    PropagateUpdate(PropagateUpdatePacket),
+    // not sure if instead we should treat it as an UpdatePacket because it has the same format.
+    // however, for readability, i think code duplication is fine here.
+    Spawn(SpawnPacket),
 }
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct PacketHeader {
     pub packet_type: u8,
-    pub id: u32,
 }
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+// no id field to optimise; enet handles differentiation of peers in our place.
 pub struct UpdatePacket {
     pub header: PacketHeader,
     pub position: [f32; 3],
     pub orientation: [f32; 4],
 }
 
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+// no id field to optimise; enet handles differentiation of peers in our place.
+pub struct SpawnPacket {
+    pub header: PacketHeader,
+    pub position: [f32; 3],
+    pub orientation: [f32; 4],
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct PropagateUpdatePacket {
+    pub header: PacketHeader,
+    pub id: u32,
+    pub position: [f32; 3],
+    pub orientation: [f32; 4],
+}
+
 // Sent by the client, once, right after connecting. Not part of the
 // Join/Leave/Update wire format above -- this is its own 17-byte shape.
+//
+// P, I converted it to the exact same format. suck my code.
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct HelloPacket {
-    pub packet_type: u8,
+    pub header: PacketHeader,
     pub uuid: [u8; 16],
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct LeavePacket {
+    pub header: PacketHeader,
+    pub id: u32,
 }
 
 impl Packet {
@@ -91,7 +135,7 @@ impl Packet {
     // (from its Hello handshake) -- we no longer trust an id field the
     // client sends us on every packet, since the client doesn't send one
     // anymore.
-    pub fn to_data(self, id: u32) -> Option<PlayerData> {
+    pub fn to_data(self) -> Option<PlayerData> {
         match self {
             Packet::Update(UpdatePacket {
                 header,
@@ -101,7 +145,6 @@ impl Packet {
                 if let Some(packet) = PacketType::from_u8(header.packet_type) {
                     if packet == PacketType::Update {
                         Some(PlayerData {
-                            id,
                             orientation: glam::Quat::from_xyzw(
                                 orientation[0],
                                 orientation[1],
@@ -119,7 +162,13 @@ impl Packet {
                     None
                 }
             }
+            // we will not need to convert these three cases to usable data, ever, but leaving as is
+            // for the compiler to scream at us when we add a new kind that we will need to convert to data.
             Packet::Header(_) => None,
+            Packet::Hello(_) => None,
+            Packet::Leave(_) => None,
+            Packet::PropagateUpdate(_) => None,
+            Packet::Spawn(_) => None,
         }
     }
 }
@@ -128,13 +177,13 @@ impl Packet {
 pub struct PlayerData {
     position: glam::Vec3,
     orientation: glam::Quat,
-    pub id: u32,
+    // now the player id is the same as the token, and we are ignoring uuid for now.
+    // pub id: u32,
 }
 
 impl PlayerData {
-    pub fn new(id: u32) -> PlayerData {
+    pub fn new() -> PlayerData {
         PlayerData {
-            id,
             // starting position:
             position: glam::Vec3::new(0f32, 0f32, 0f32),
             orientation: glam::Quat::IDENTITY,
@@ -151,12 +200,21 @@ impl PlayerData {
     // where a player was standing when they left. The client parses the
     // header first and only reads the rest for types that need it (see
     // NetworkSession::poll on the client).
-    pub fn to_packet_bytes(&self, packet_type: PacketType) -> Vec<u8> {
+    pub fn to_packet_bytes(&self, packet_type: PacketType, id: u32) -> Vec<u8> {
         match packet_type {
-            PacketType::Join | PacketType::Update => UpdatePacket {
+            PacketType::PropagateUpdate | PacketType::Join => PropagateUpdatePacket {
                 header: PacketHeader {
                     packet_type: packet_type.to_u8(),
-                    id: self.id,
+                },
+                id,
+                position: self.position.to_array(),
+                orientation: self.orientation.to_array(),
+            }
+            .as_bytes()
+            .to_vec(),
+            PacketType::Spawn => SpawnPacket {
+                header: PacketHeader {
+                    packet_type: packet_type.to_u8(),
                 },
                 position: self.position.to_array(),
                 orientation: self.orientation.to_array(),
@@ -165,17 +223,16 @@ impl PlayerData {
             .to_vec(),
             PacketType::Leave => PacketHeader {
                 packet_type: packet_type.to_u8(),
-                id: self.id,
             }
             .as_bytes()
             .to_vec(),
             PacketType::Hello => {
                 unreachable!("Hello is only ever sent by the client, never by the server")
             }
+            PacketType::Update => {
+                unreachable!("Update is only ever sent by the client, never by the server")
+            }
         }
-    }
-    pub fn with_id(&self, id: u32) -> Self {
-        PlayerData { id, ..*self }
     }
 }
 
@@ -202,9 +259,9 @@ pub enum ReceiveError {
     // Peer sent something before we'd received its Hello / assigned it a
     // session id yet -- dropped, not an error worth surfacing loudly.
     PeerNotIdentified,
-    InvalidHeader { id: u32 },
-    UnreadableHeader { id: u32 },
-    NonUpdateEvent { id: u32 },
+    InvalidHeader { id: Option<u32> },
+    UnreadableHeader { id: Option<u32> },
+    NonUpdateEvent { id: Option<u32> },
     // Peer already has a session (sent Hello before); a second Hello is
     // ignored rather than re-identified.
     AlreadyIdentified { id: u32 },
