@@ -342,6 +342,11 @@ pub fn handle_event_error(e: EventError) {
                     token
                 )
             }
+            ReceiveError::PeerWithoutToken => {
+                eprintln!(
+                    "error: all enet::Peer should have a token, they were given one on connect. And yet..."
+                )
+            }
         },
     }
 }
