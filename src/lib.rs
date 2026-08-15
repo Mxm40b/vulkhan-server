@@ -51,7 +51,7 @@ fn handle_connect_request(
     // if you try to reuse temp_data later, rust will complain.
     // see chap 4 of the rust book.
     server_state.players_data.insert(token, temp_data);
-    let Some(new_player) = &server_state.players_data.get(&token) else {
+    let Some(new_player_data) = &server_state.players_data.get(&token) else {
         return Err(EventError::ConnectError(
             ConnectError::NewPlayerWithoutData { token },
         ));
@@ -64,23 +64,22 @@ fn handle_connect_request(
     // the other communicates position and id.
     server_state.things_to_send.push(SendToWhom::ToAllButOne(
         token,
-        new_player.to_packet_bytes(PacketType::Join).clone(),
+        new_player_data.to_packet_bytes(PacketType::Join).clone(),
         enet::PacketMode::ReliableSequenced,
     ));
-    // this sends the new player all the old players' data
+    // this sends the new player all the old players' data,
+    // and their own position and token.
+    // they know the packet that gives them their token
+    // because in its header is the enum ShareToken.
     for client in server_state.players_data.values() {
         match client.id {
             id if id == new_id => {
-                let Some(data_to_send) = server_state.players_data.get(&token) else {
-                    return Err(EventError::ConnectError(ConnectError::PeerWithoutToken));
-                };
                 server_state.things_to_send.push(SendToWhom::ToOne(
                     token,
                     // we change the id to the token and reuse the same type of packet
-                    // because we are lazy
                     // and this is only sent once per connection,
                     // and no useless data is shared anyways
-                    data_to_send
+                    new_player_data
                         .with_id(token)
                         .to_packet_bytes(PacketType::ShareToken),
                     enet::PacketMode::ReliableSequenced,
