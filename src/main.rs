@@ -35,10 +35,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         // and sends each thing from the main thread, either to all players, or to a single one.
         //
         // this let statement is the scope in question:
-        let () = {
-            let attempt = enet.service(1000); // this lineeeeee... UUUUUUGH
+        {
+            let attempt = enet.service(1000); // this line
             await_event(attempt, &mut server_state);
-        };
+        }
         // end of that scope to get rid of enet borrowing error
         for to_do in server_state.things_to_send.drain(..) {
             vulkhan_server::handle_send_list(to_do, &mut enet);

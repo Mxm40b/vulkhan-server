@@ -11,16 +11,22 @@ pub enum PacketType {
     Leave,
     Update,
     // serves to share token and spawn position on connect:
+    // todo: send that player a different kind of packet that contains an additional field
+    // to have both id and token.
+    // to do that, we will split into two categories of packets: connect response packets / information packets, and position packets.
+    // the position packets will still reuse the id one way to send tokens, and the other to give only the player id
+    // the information packets will contain a packet type header, an id and a token. more fields may be added, in which case they will be
+    // default values when unneeded, given that they will not be sent very often this is an acceptable compromise for simplicity.
     ShareToken,
-    // serves to tell the player who was already on the server:
+    // serves to tell the players who were already on the server:
     NotifyStatusOnConnect,
 }
 
 #[derive(Clone)]
 pub enum SendToWhom {
-    ToAll(Vec<u8>),
-    ToOne(u32, Vec<u8>),
-    ToAllButOne(u32, Vec<u8>),
+    ToAll(Vec<u8>, enet::PacketMode),
+    ToOne(u32, Vec<u8>, enet::PacketMode),
+    ToAllButOne(u32, Vec<u8>, enet::PacketMode),
 }
 
 impl PacketType {
@@ -138,6 +144,8 @@ impl PlayerData {
             .as_bytes()
             .to_vec(),
             // only sending header with player id when a player disconnects instead of everything
+            // P, notice this code: all types of packets send position, see PacketType enum for more comments,
+            // except for Leave which does not need to send position.
             PacketType::Leave => PacketHeader {
                 packet_type: packet_type.to_u8(),
                 id: self.id,
@@ -151,8 +159,13 @@ impl PlayerData {
     }
 }
 
-pub fn generate_token() -> u32 {
-    rand::random::<u32>() // thank you, rand crate!
+pub fn generate_token(server_state: ServerState) -> u32 {
+    loop {
+        let token = rand::random::<u32>(); // thank you, rand crate!
+        if token != 0 && !server_state.players_data.contains_key(&token) {
+            return token;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -160,6 +173,8 @@ pub struct ServerState {
     pub players_data: HashMap<u32, PlayerData>,
 
     pub things_to_send: Vec<SendToWhom>,
+
+    pub highest_player_id: u32,
 }
 
 // impl ServerState {

@@ -42,21 +42,10 @@ fn handle_connect_request(
     // the enet::Peer type, and also as a key in the hashmap that stores
     // players' data.
     peer.set_data(Some(token));
-    let new_id = server_state
-        .players_data
-        .values()
-        .fold(0, |max_up_to_here, data| {
-            if data.id > max_up_to_here {
-                data.id
-            } else {
-                max_up_to_here
-            }
-        })
-        + 1;
-    // id is incremental: 1, 2, 3...
+    let new_id = server_state.highest_player_id + 1;
+    server_state.highest_player_id = new_id;
+    // id is incremental: 1, 2, 3... note: starts at one because highest_player_id default value is 0.
     // now if a player quits, and another joins, there will just be an unassigned id.
-    // TODO: better implement this behaviour, because every single time a player connects,
-    // we search through, instead we could just have an incremented variable
     let temp_data = PlayerData::new(new_id);
     // Pierre, here you notice that the owner of that data is now the hashmap.
     // if you try to reuse temp_data later, rust will complain.
@@ -75,6 +64,7 @@ fn handle_connect_request(
     server_state.things_to_send.push(SendToWhom::ToAllButOne(
         token,
         new_player.to_packet_bytes(PacketType::Join).clone(),
+        enet::PacketMode::ReliableSequenced,
     ));
     // this sends the new player all the old players' data
     for client in server_state.players_data.values() {
@@ -90,12 +80,13 @@ fn handle_connect_request(
                         // and this is only sent once per connection,
                         // and no useless data is shared anyways
                         .with_id(token)
-                        .to_packet_bytes(PacketType::ShareToken),
+                        .to_packet_bytes(PacketType::ShareToken),enet::PacketMode::ReliableSequenced
                 ))
             }
             _ => server_state.things_to_send.push(SendToWhom::ToOne(
                 token,
                 client.to_packet_bytes(PacketType::NotifyStatusOnConnect),
+                enet::PacketMode::ReliableSequenced,
             )),
         }
     }
@@ -136,6 +127,7 @@ fn handle_disconnect(server_state: &mut ServerState, token: &u32) -> Result<(), 
     // send everyone a disconnect Packet
     server_state.things_to_send.push(SendToWhom::ToAll(
         player.to_packet_bytes(PacketType::Leave).clone(),
+        enet::PacketMode::ReliableSequenced,
     ));
     server_state.players_data.remove(token);
     Ok(())
@@ -217,12 +209,14 @@ fn handle_receive(
             server_state.players_data.insert(packet.header.id, new_data);
             // send update to all players
             // TODO: turn the following expect into an error to return, to not crash the server
-            server_state.things_to_send.push(SendToWhom::ToAll(
+            server_state.things_to_send.push(SendToWhom::ToAllButOne(
+                actual_token,
                 server_state
                     .players_data
                     .get(&actual_token)
                     .expect("all peers given token and data on connect")
                     .to_packet_bytes(PacketType::Update),
+                enet::PacketMode::UnreliableSequenced,
             ))
         }
     }
@@ -233,14 +227,11 @@ fn handle_receive(
 // from the main thread
 pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
     // two types of messages to send: only to one client, or to all (eg updates)
-    match to_do.clone() {
-        SendToWhom::ToAll(packet_to_send) => {
+    match to_do {
+        SendToWhom::ToAll(packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
-                match enet::Packet::new(
-                    packet_to_send.as_slice(),
-                    enet::PacketMode::ReliableSequenced,
-                ) {
-                    Ok(packet) => match peer.send_packet(packet, 0) {
+                match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
+                    Ok(packet) => match send_helper(&mut peer, packet, packet_mode) {
                         Ok(_) => (),
                         Err(e) => eprintln!("error: could not send packet, got error: {e}"),
                     },
@@ -250,14 +241,11 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
         }
         // in this case, we do not check that this user exists, we assume
         // function that said to send this can be trusted.
-        SendToWhom::ToAllButOne(token, packet_to_send) => {
+        SendToWhom::ToAllButOne(token, packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
                 if *peer.data().expect("all peers given token on connect") != token {
-                    match enet::Packet::new(
-                        packet_to_send.as_slice(),
-                        enet::PacketMode::ReliableSequenced,
-                    ) {
-                        Ok(packet) => match peer.send_packet(packet, 0) {
+                    match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
+                        Ok(packet) => match send_helper(&mut peer, packet, packet_mode) {
                             Ok(_) => (),
                             Err(e) => eprintln!("error: could not send packet, got error: {e}"),
                         },
@@ -266,16 +254,13 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) {
                 }
             });
         }
-        SendToWhom::ToOne(token, packet_to_send) => {
+        SendToWhom::ToOne(token, packet_to_send, packet_mode) => {
             if let Some(peer) = enet
                 .peers()
                 .find(|peer| *peer.data().expect("all peers given token on connect") == token)
             {
-                match enet::Packet::new(
-                    packet_to_send.as_slice(),
-                    enet::PacketMode::ReliableSequenced,
-                ) {
-                    Ok(packet) => match peer.clone().send_packet(packet, 0) {
+                match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
+                    Ok(packet) => match send_helper(&mut peer.clone(), packet, packet_mode) {
                         Ok(_) => (),
                         Err(e) => eprintln!(
                             "error: could not send packet to peer {:?}, instead got: {}",
@@ -356,5 +341,24 @@ pub fn handle_event_error(e: EventError) {
                 )
             }
         },
+    }
+}
+
+pub fn send_helper(
+    peer: &mut enet::Peer<u32>,
+    packet: enet::Packet,
+    mode: enet::PacketMode,
+) -> Result<(), enet::Error> {
+    match mode {
+        // separating reliable sequenced and unreliable sequenced so that connect and disconnect happen quickly,
+        // and so that movement packets don't block them
+        enet::PacketMode::ReliableSequenced => peer.send_packet(packet, 0),
+        enet::PacketMode::UnreliableSequenced => peer.send_packet(packet, 1),
+        enet::PacketMode::UnreliableUnsequenced => {
+            eprintln!(
+                "warning: sending packet as unreliable unsequenced, this should not be possible"
+            );
+            peer.send_packet(packet, 1)
+        }
     }
 }
