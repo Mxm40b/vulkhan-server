@@ -59,7 +59,9 @@ fn await_event(
             // otherwise we handle the event:
             Some(event) => {
                 let mut event = event; // to borrow it as mutable, not sure how but it works
-                vulkhan_server::handle_event(&mut event, server_state);
+                if let Err(e) = vulkhan_server::handle_event(&mut event, server_state) {
+                    vulkhan_server::handle_event_error(e)
+                };
             }
         }
     } else {

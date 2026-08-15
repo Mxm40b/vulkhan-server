@@ -173,3 +173,27 @@ pub struct ServerState {
 //         }
 //     }
 // }
+
+pub enum ReceiveError {
+    // InvalidPacketData,
+    InvalidHeader { token: u32 },
+    UnreadableHeader { token: u32 },
+    NonUpdateEvent { token: u32 },
+    TokenMismatch { expected: u32, got: u32 },
+    PlayerNotFound { token: u32 },
+    UnreadableDataReceived { token: u32 },
+    AssociatedDataNotFound { token: u32 },
+}
+pub enum ConnectError {}
+// only adding for structure now, if error cases are discovered,
+
+pub enum DisconnectError {
+    InvalidToken,
+    NoDataStored { token: u32 },
+}
+
+pub enum EventError {
+    ReceiveError(ReceiveError),
+    ConnectError(ConnectError),
+    DisconnectError(DisconnectError),
+}
