@@ -117,6 +117,7 @@ impl Packet {
     }
 }
 
+#[derive(Clone)]
 pub struct PlayerData {
     position: glam::Vec3,
     orientation: glam::Quat,

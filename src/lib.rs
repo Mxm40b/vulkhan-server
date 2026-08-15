@@ -46,16 +46,13 @@ fn handle_connect_request(
     server_state.highest_player_id = new_id;
     // id is incremental: 1, 2, 3... note: starts at one because highest_player_id default value is 0.
     // now if a player quits, and another joins, there will just be an unassigned id.
-    let temp_data = PlayerData::new(new_id);
+    let new_player_data = PlayerData::new(new_id);
     // Pierre, here you notice that the owner of that data is now the hashmap.
     // if you try to reuse temp_data later, rust will complain.
     // see chap 4 of the rust book.
-    server_state.players_data.insert(token, temp_data);
-    let Some(new_player_data) = server_state.players_data.get(&token) else {
-        return Err(EventError::ConnectError(
-            ConnectError::NewPlayerWithoutData { token },
-        ));
-    };
+    server_state
+        .players_data
+        .insert(token, new_player_data.clone());
     // two messages: one will send to all but the client,
     // the position data, and one will send only to that client,
     // their token so that they can use it for later messages.
