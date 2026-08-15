@@ -51,7 +51,7 @@ fn handle_connect_request(
     // if you try to reuse temp_data later, rust will complain.
     // see chap 4 of the rust book.
     server_state.players_data.insert(token, temp_data);
-    let Some(new_player_data) = &server_state.players_data.get(&token) else {
+    let Some(new_player_data) = server_state.players_data.get(&token) else {
         return Err(EventError::ConnectError(
             ConnectError::NewPlayerWithoutData { token },
         ));
@@ -64,7 +64,7 @@ fn handle_connect_request(
     // the other communicates position and id.
     server_state.things_to_send.push(SendToWhom::ToAllButOne(
         token,
-        new_player_data.to_packet_bytes(PacketType::Join).clone(),
+        new_player_data.to_packet_bytes(PacketType::Join),
         enet::PacketMode::ReliableSequenced,
     ));
     // this sends the new player all the old players' data,
@@ -128,7 +128,7 @@ fn handle_disconnect(server_state: &mut ServerState, token: &u32) -> Result<(), 
     // };
     // send everyone a disconnect Packet
     server_state.things_to_send.push(SendToWhom::ToAll(
-        player.to_packet_bytes(PacketType::Leave).clone(),
+        player.to_packet_bytes(PacketType::Leave),
         enet::PacketMode::ReliableSequenced,
     ));
     server_state.players_data.remove(token);
