@@ -51,6 +51,14 @@ impl PacketType {
     }
 }
 
+// pub trait Packet: Clone + DeriveEq {}
+// TODO: we will eventually replace the packet enum with a trait,
+// and all types of packets will have that trait.
+// then, all functions that manipulate packets will instead deal with the packet trait.
+// their PacketType will say wether they are of the InformationPacket
+// or the PositionPacket variant,
+// meaning PacketType enum will be shared between both kinds.
+
 pub enum Packet {
     Update(UpdatePacket),
     Header(PacketHeader),
