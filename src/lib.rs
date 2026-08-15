@@ -248,7 +248,7 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
         SendToWhom::ToAllButOne(token, packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
                 let Some(&receiver_token) = peer.data() else {
-                    eprintln!("error: peer without token");
+                    eprintln!("error: sending to all, peer without token");
                     return;
                 };
                 if receiver_token != token {
@@ -265,7 +265,7 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
         SendToWhom::ToOne(token, packet_to_send, packet_mode) => {
             if let Some(peer) = enet.peers().find(|peer| {
                 let Some(&receiver_token) = peer.data() else {
-                    eprintln!("error: peer without token");
+                    eprintln!("error: sending to one, peer without token");
                     return false;
                 };
                 receiver_token == token
@@ -298,7 +298,7 @@ pub fn handle_event_error(e: EventError) {
     match e {
         EventError::ConnectError(e) => match e {
             ConnectError::PeerWithoutToken => {
-                eprintln!("error: peer without token")
+                eprintln!("error: on connect, peer without token")
             }
             ConnectError::NewPlayerWithoutData { token } => {
                 eprintln!(
