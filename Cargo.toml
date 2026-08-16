@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 enet = "0.3.0"
 glam = "0.33.3"
+num_enum = "0.7.6"
 rand = "0.10.2"
 # using this syntax instead of separately adding zerocopy-derive
 # crate because i don't care much about compile time for now, and i am a beginner,

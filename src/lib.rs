@@ -112,40 +112,21 @@ fn handle_receive(
                 .players_data
                 .insert(new_id, new_player_data.clone());
 
-            server_state.things_to_send.push(SendToWhom::ToAllButOne(
-                new_id,
-                new_player_data.to_packet_bytes(PacketType::Join, new_id),
-                enet::PacketMode::ReliableSequenced,
-            ));
-
             server_state.things_to_send.push(SendToWhom::ToOne(
                 new_id,
                 new_player_data.to_packet_bytes(PacketType::Spawn, new_id),
                 enet::PacketMode::ReliableSequenced,
             ));
 
-            server_state
-                .players_data
-                .iter()
-                // idk why need to deref twice but it works:
-                // this line is to not send to the user that just connected, their own data, we just did that:
-                .filter(|(key, _value)| (**key) != new_id)
-                .map(|(&key, existing_player)| {
-                    server_state.things_to_send.push(SendToWhom::ToOne(
-                        new_id,
-                        existing_player.to_packet_bytes(PacketType::Join, key),
-                        enet::PacketMode::ReliableSequenced,
-                    ));
-                })
-                // consumes the iterator:
-                .for_each(drop);
+            // No need to notify everyone about the new player, they will receive UpdatePackets and
+            // notice themselves that a new Alpha Wolf has joined
         }
-        PacketType::Join | PacketType::Leave | PacketType::PropagateUpdate | PacketType::Spawn => {
+        PacketType::Leave | PacketType::ServerUpdate | PacketType::Spawn => {
             return Err(EventError::ReceiveError(ReceiveError::NonUpdateEvent {
                 id: peer_id,
             }));
         }
-        PacketType::Update => {
+        PacketType::ClientUpdate => {
             // if the peer does not have an associated id, we exit early; they need to send a ConnectPacket first.
             let id = peer_id.ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?;
             let (packet, _trailing_data) =
@@ -184,7 +165,7 @@ fn handle_receive(
                     .players_data
                     .get(&id)
                     .ok_or(EventError::ReceiveError(ReceiveError::PeerNotIdentified))?
-                    .to_packet_bytes(PacketType::PropagateUpdate, id),
+                    .to_packet_bytes(PacketType::ServerUpdate, id),
                 enet::PacketMode::UnreliableSequenced,
             ))
         }
@@ -275,6 +256,9 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
     match to_do {
         SendToWhom::ToAll(packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
+                if peer.state() != enet::PeerState::Connected {
+                    return;
+                }
                 match enet::Packet::new(packet_to_send.as_slice(), packet_mode) {
                     Ok(packet) => match send_helper(&mut peer, packet, packet_mode) {
                         Ok(_) => (),
@@ -288,6 +272,10 @@ pub fn handle_send_list(to_do: SendToWhom, enet: &mut enet::Host<u32>) -> Result
         // function that said to send this can be trusted.
         SendToWhom::ToAllButOne(id, packet_to_send, packet_mode) => {
             enet.peers().for_each(move |mut peer| {
+                if peer.state() != enet::PeerState::Connected {
+                    return;
+                }
+
                 let Some(&receiver_id) = peer.data() else {
                     // un-identified peers haven't sent Hello yet -- they get
                     // nothing until they do.

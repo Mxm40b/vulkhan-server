@@ -1,29 +1,23 @@
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use rand;
 
 use std::collections::HashMap;
 
-#[derive(PartialEq, Debug)]
+#[repr(u8)]
+#[derive(PartialEq, Debug, Clone, Copy, IntoPrimitive, TryFromPrimitive)]
 pub enum PacketType {
-    // sent to tell players that are already/still here who joined/left,
-    // and also reused server-side to dump existing players' state to a
-    // freshly-identified client (the wire bytes are identical either way,
-    // and the client treats them identically too):
-    Join,
-    Leave,
-    Update,
-    // sent once by the client, right after connecting, carrying its
-    // persistent UUID. The server assigns a session id in response to this
-    // and never needs to send it back to the client (see HelloPacket).
-    Hello,
-    // this type serves to share updates received by server with others.
-    // ignore the lies told above, this type of packet holds an id
-    // while the Update does not.
-    PropagateUpdate,
-    // this type is used to inform the player of where they spawn, because the
-    // server decides this (the server remembers where the player logged off)
-    Spawn,
+    // Broadcast everyone about who disconnected
+    Leave = 0,
+    // No ID, will find it, sent by client
+    ClientUpdate = 1,
+    // Handshake
+    Hello = 2,
+    // For broadcasting updates with found IDs
+    ServerUpdate = 3,
+    // Useless bullshit
+    Spawn = 4,
 }
 
 #[derive(Clone)]
@@ -35,25 +29,11 @@ pub enum SendToWhom {
 
 impl PacketType {
     pub fn from_u8(val: u8) -> Option<Self> {
-        match val {
-            0 => Some(PacketType::Join),
-            1 => Some(PacketType::Leave),
-            2 => Some(PacketType::Update),
-            3 => Some(PacketType::Hello),
-            4 => Some(PacketType::PropagateUpdate),
-            5 => Some(PacketType::Spawn),
-            _ => None,
-        }
+        Self::try_from(val).ok()
     }
-    pub fn to_u8(&self) -> u8 {
-        match self {
-            Self::Join => 0,
-            Self::Leave => 1,
-            Self::Update => 2,
-            Self::Hello => 3,
-            Self::PropagateUpdate => 4,
-            Self::Spawn => 5,
-        }
+
+    pub fn to_u8(self) -> u8 {
+        self as u8
     }
 }
 
@@ -110,7 +90,7 @@ pub struct PropagateUpdatePacket {
 }
 
 // Sent by the client, once, right after connecting. Not part of the
-// Join/Leave/Update wire format above -- this is its own 17-byte shape.
+// Leave/Update wire format above -- this is its own 17-byte shape.
 //
 // P, I converted it to the exact same format. suck my code.
 #[repr(C, packed)]
@@ -143,7 +123,7 @@ impl Packet {
                 orientation,
             }) => {
                 if let Some(packet) = PacketType::from_u8(header.packet_type) {
-                    if packet == PacketType::Update {
+                    if packet == PacketType::ClientUpdate {
                         Some(PlayerPositionData {
                             orientation: glam::Quat::from_xyzw(
                                 orientation[0],
@@ -206,7 +186,7 @@ impl PlayerData {
     // correctly laid-out in memory
     // Packet type then take it as bytes
     //
-    // Join/Update go out as the full 33-byte UpdatePacket shape (position +
+    // Update go out as the full 33-byte UpdatePacket shape (position +
     // orientation are meaningful for both). Leave only needs the 5-byte
     // header -- there's no point spending 28 extra bytes telling everyone
     // where a player was standing when they left. The client parses the
@@ -214,7 +194,7 @@ impl PlayerData {
     // NetworkSession::poll on the client).
     pub fn to_packet_bytes(&self, packet_type: PacketType, id: u32) -> Vec<u8> {
         match packet_type {
-            PacketType::PropagateUpdate | PacketType::Join => PropagateUpdatePacket {
+            PacketType::ServerUpdate => PropagateUpdatePacket {
                 header: PacketHeader {
                     packet_type: packet_type.to_u8(),
                 },
@@ -241,7 +221,7 @@ impl PlayerData {
             PacketType::Hello => {
                 unreachable!("Hello is only ever sent by the client, never by the server")
             }
-            PacketType::Update => {
+            PacketType::ClientUpdate => {
                 unreachable!("Update is only ever sent by the client, never by the server")
             }
         }
